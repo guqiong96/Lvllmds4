@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_matmul_decode_enabled,
+    triton_sparse_mla_prefill_topk_chunk_size,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
 )
@@ -599,9 +600,10 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         kv_flat = kv.reshape(-1, q.shape[-1])
-        topk_chunk_size = min(
-            combined_indices.shape[-1],
-            triton_sparse_mla_topk_chunk_size(),
+        topk_chunk_size = triton_sparse_mla_prefill_topk_chunk_size(
+            combined_topk_size=combined_indices.shape[-1],
+            compress_ratio=int(layer.compress_ratio),
+            request_count=kv.shape[0],
         )
         query_chunk_size = min(
             q.shape[0],
