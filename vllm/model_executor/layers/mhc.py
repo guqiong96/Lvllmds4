@@ -12,6 +12,18 @@ from vllm.utils.import_utils import has_tilelang
 HAS_TILELANG = has_tilelang()
 
 
+def _apply_optional_rms_norm(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> torch.Tensor:
+    if norm_weight is None:
+        return x
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x.float() * torch.rsqrt(variance + norm_eps)
+    return (x_normed * norm_weight.float()).to(x.dtype)
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -42,7 +54,10 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_pre_tilelang(
+        # Keep CUDA on the pre-#43679 fallback path. Tilelang MHC kernels
+        # currently fail NVCC compilation on SM120 under CUDA 13/Python 3.13
+        # because CUDA and system math headers disagree on rsqrt/rsqrtf.
+        post_mix, comb_mix, layer_input = self.forward_native(
             residual,
             fn,
             hc_scale,
@@ -53,8 +68,9 @@ class MHCPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
             n_splits,
-            norm_weight,
-            norm_eps,
+        )
+        return post_mix, comb_mix, _apply_optional_rms_norm(
+            layer_input, norm_weight, norm_eps
         )
 
     def forward_hip(
@@ -171,9 +187,7 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.vllm.mhc_post_tilelang(
-            x, residual, post_layer_mix, comb_res_mix
-        )
+        return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
 
     def forward_hip(
         self,
@@ -233,6 +247,12 @@ class MHCPostOp(CustomOp):
 # can't reconcile the ``self`` parameter. Keeping the body as a free
 # function — the layout that existed pre-#41946 — sidesteps the bind
 # failure while preserving the spec-acceptance recovery.
+#
+# Keep CUDA on the Triton HC-head kernel even when Tilelang is installed. As
+# above, the Tilelang HC-head kernel fails to compile for the DSv4
+# hidden_size=7168 shape under the current SM120 CUDA 13/Python 3.13 runtime.
+# The Triton kernel covers the same CUDA path and avoids making model startup
+# depend on that Tilelang compile.
 @torch.compile(backend=current_platform.simple_compile_backend)
 def _hc_head_cuda_impl(
     hidden_states: torch.Tensor,
@@ -250,7 +270,7 @@ def _hc_head_cuda_impl(
     out = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
     )
-    torch.ops.vllm.hc_head_fused_kernel_tilelang(
+    torch.ops.vllm.hc_head_triton(
         hs_flat,
         hc_fn,
         hc_scale,
@@ -380,11 +400,14 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+        residual_cur = mhc_kernels.mhc_post_torch(
             x,
             residual,
             post_layer_mix,
             comb_res_mix,
+        )
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
+            residual_cur,
             fn,
             hc_scale,
             hc_base,
@@ -394,9 +417,12 @@ class MHCFusedPostPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
             n_splits,
-            tile_n,
-            norm_weight,
-            norm_eps,
+        )
+        return (
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            _apply_optional_rms_norm(layer_input_cur, norm_weight, norm_eps),
         )
 
     def forward_hip(

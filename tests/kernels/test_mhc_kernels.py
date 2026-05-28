@@ -8,6 +8,11 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
 )
+from vllm.model_executor.layers.mhc import (
+    MHCFusedPostPreOp,
+    MHCPreOp,
+    _hc_head_cuda_impl,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.torch_utils import set_random_seed
@@ -94,6 +99,11 @@ def hc_head_ref(
     pre_mix = torch.nn.functional.linear(residual_norm, fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
     return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).bfloat16()
+
+
+def rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
 
 
 @pytest.mark.skipif(
@@ -285,8 +295,8 @@ def test_mhc_fused_post_pre(num_tokens, hidden_size, hc_mult):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_rocm(),
-    reason="ROCm required",
+    not current_platform.is_cuda_alike(),
+    reason="CUDA or ROCm required",
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
@@ -321,6 +331,150 @@ def test_hc_head_triton(num_tokens, hidden_size, hc_mult):
 
     out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+def test_hc_head_cuda_impl_uses_triton_fallback():
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    hidden_size = 7168
+    hc_mult = 4
+    residual = torch.randn((1, hc_mult, hidden_size), dtype=torch.bfloat16)
+    fn = torch.randn((hc_mult, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((1,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
+    rms_eps = hc_eps = 1e-6
+
+    out = _hc_head_cuda_impl(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
+    torch.cuda.synchronize()
+
+    out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+def test_mhc_pre_cuda_fallback_preserves_fused_norm(default_vllm_config):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    num_tokens = 1
+    hidden_size = 7168
+    hc_mult = 4
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16)
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = norm_eps = 1e-6
+    sinkhorn_repeat = 20
+    hc_post_alpha = 1.0
+
+    out = MHCPreOp().forward_cuda(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    ref_post, ref_comb, ref_layer_input = mhc_pre_ref(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+
+    torch.testing.assert_close(out[0], ref_post, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(out[1], ref_comb, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        out[2],
+        rms_norm_ref(ref_layer_input, norm_weight, norm_eps),
+        atol=5e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="CUDA required",
+)
+def test_mhc_fused_post_pre_cuda_fallback_preserves_fused_norm(default_vllm_config):
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+
+    num_tokens = 1
+    hidden_size = 7168
+    hc_mult = 4
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16)
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = norm_eps = 1e-6
+    sinkhorn_repeat = 20
+    hc_post_alpha = 1.0
+
+    out = MHCFusedPostPreOp().forward_cuda(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    residual_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    post_ref, comb_ref, layer_input_ref = mhc_pre_ref(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+
+    torch.testing.assert_close(out[0], residual_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(out[1], post_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(out[2], comb_ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        out[3],
+        rms_norm_ref(layer_input_ref, norm_weight, norm_eps),
+        atol=5e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.skipif(
