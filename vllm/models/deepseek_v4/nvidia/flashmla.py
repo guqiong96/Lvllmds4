@@ -35,12 +35,14 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_partial_states,
     build_combined_sparse_mla_decode_valid_mask,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     matmul_sparse_mla_attention_with_sink,
+    merge_sparse_mla_attention_states,
     sparse_mla_decode_head_block_size,
 )
 from vllm.v1.attention.ops.flashmla import (
@@ -238,6 +240,17 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 max_query_chunk_tokens,
                 triton_sparse_mla_query_chunk_size(),
             )
+            topk_chunk_size = triton_sparse_mla_prefill_topk_chunk_size(
+                combined_topk_size=combined_topk,
+                compress_ratio=compress_ratio,
+                request_count=cls.PREFILL_CHUNK_SIZE,
+            )
+            partial_part_size = min(topk_chunk_size, 512)
+            partial_parts = (
+                (combined_topk + partial_part_size - 1) // partial_part_size
+                if combined_topk > partial_part_size
+                else 0
+            )
             specs.extend(
                 [
                     ((query_chunk_size, num_heads), torch.float32),
@@ -245,6 +258,28 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     ((query_chunk_size, num_heads, head_dim), torch.float32),
                 ]
             )
+            if partial_parts > 1:
+                specs.extend(
+                    [
+                        ((partial_parts, query_chunk_size, num_heads), torch.float32),
+                        ((partial_parts, query_chunk_size, num_heads), torch.float32),
+                        (
+                            (
+                                partial_parts,
+                                query_chunk_size,
+                                num_heads,
+                                head_dim,
+                            ),
+                            torch.float32,
+                        ),
+                        ((query_chunk_size, num_heads), torch.float32),
+                        ((query_chunk_size, num_heads), torch.float32),
+                        ((query_chunk_size, num_heads, head_dim), torch.float32),
+                        ((query_chunk_size, num_heads), torch.float32),
+                        ((query_chunk_size, num_heads), torch.float32),
+                        ((query_chunk_size, num_heads, head_dim), torch.float32),
+                    ]
+                )
         return tuple(specs)
 
     @classmethod
@@ -597,7 +632,7 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         combined_indices: torch.Tensor,
         combined_lens: torch.Tensor,
         output: torch.Tensor,
-        state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        state_buffers: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         kv_flat = kv.reshape(-1, q.shape[-1])
         topk_chunk_size = triton_sparse_mla_prefill_topk_chunk_size(
@@ -620,7 +655,8 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ((query_chunk_size, layer.num_heads, q.shape[-1]), torch.float32),
             )
         else:
-            max_score_buffer, denom_buffer, output_buffer = state_buffers
+            max_score_buffer, denom_buffer, output_buffer = state_buffers[:3]
+        partial_state_buffers = state_buffers[3:] if state_buffers is not None else ()
 
         for token_start in range(0, q.shape[0], query_chunk_size):
             token_end = min(token_start + query_chunk_size, q.shape[0])
@@ -631,31 +667,120 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             max_score = max_score_buffer[:num_tokens]
             denom = denom_buffer[:num_tokens]
             subset_acc = output_buffer[:num_tokens]
-            max_score.fill_(float("-inf"))
-            denom.zero_()
-            subset_acc.zero_()
-
-            for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
-                index_end = min(
-                    index_start + topk_chunk_size,
-                    combined_indices.shape[-1],
-                )
-                accumulate_indexed_sparse_mla_attention_chunk(
+            part_size = min(topk_chunk_size, 512)
+            num_parts = (
+                (combined_indices.shape[-1] + part_size - 1) // part_size
+                if part_size > 0
+                else 1
+            )
+            if kv.shape[0] == 1 and len(partial_state_buffers) == 9 and num_parts > 1:
+                (
+                    partial_max_buffer,
+                    partial_denom_buffer,
+                    partial_acc_buffer,
+                    merge0_max_buffer,
+                    merge0_denom_buffer,
+                    merge0_acc_buffer,
+                    merge1_max_buffer,
+                    merge1_denom_buffer,
+                    merge1_acc_buffer,
+                ) = partial_state_buffers
+                partial_max = partial_max_buffer[:num_parts, :num_tokens]
+                partial_denom = partial_denom_buffer[:num_parts, :num_tokens]
+                partial_acc = partial_acc_buffer[:num_parts, :num_tokens]
+                accumulate_indexed_sparse_mla_attention_partial_states(
                     q=q_chunk,
                     kv_flat=kv_flat,
-                    indices=indices_chunk_full[:, index_start:index_end],
+                    indices=indices_chunk_full,
                     lens=lens_chunk,
-                    candidate_offset=index_start,
+                    candidate_offset=0,
                     scale=layer.scale,
-                    max_score=max_score,
-                    denom=denom,
-                    acc=subset_acc,
+                    part_size=part_size,
+                    max_score=partial_max,
+                    denom=partial_denom,
+                    acc=partial_acc,
                 )
+                merge_sparse_mla_attention_states(
+                    partial_max[0],
+                    partial_denom[0],
+                    partial_acc[0],
+                    partial_max[1],
+                    partial_denom[1],
+                    partial_acc[1],
+                    max_score,
+                    denom,
+                    subset_acc,
+                )
+                current_max = max_score
+                current_denom = denom
+                current_acc = subset_acc
+                scratch_max = merge0_max_buffer[:num_tokens]
+                scratch_denom = merge0_denom_buffer[:num_tokens]
+                scratch_acc = merge0_acc_buffer[:num_tokens]
+                alt_max = merge1_max_buffer[:num_tokens]
+                alt_denom = merge1_denom_buffer[:num_tokens]
+                alt_acc = merge1_acc_buffer[:num_tokens]
+                for part_idx in range(2, num_parts):
+                    merge_sparse_mla_attention_states(
+                        current_max,
+                        current_denom,
+                        current_acc,
+                        partial_max[part_idx],
+                        partial_denom[part_idx],
+                        partial_acc[part_idx],
+                        scratch_max,
+                        scratch_denom,
+                        scratch_acc,
+                    )
+                    current_max, scratch_max, alt_max = (
+                        scratch_max,
+                        alt_max,
+                        current_max,
+                    )
+                    current_denom, scratch_denom, alt_denom = (
+                        scratch_denom,
+                        alt_denom,
+                        current_denom,
+                    )
+                    current_acc, scratch_acc, alt_acc = (
+                        scratch_acc,
+                        alt_acc,
+                        current_acc,
+                    )
+                finish_max = current_max
+                finish_denom = current_denom
+                finish_acc = current_acc
+            else:
+                max_score.fill_(float("-inf"))
+                denom.zero_()
+                subset_acc.zero_()
+
+                for index_start in range(
+                    0, combined_indices.shape[-1], topk_chunk_size
+                ):
+                    index_end = min(
+                        index_start + topk_chunk_size,
+                        combined_indices.shape[-1],
+                    )
+                    accumulate_indexed_sparse_mla_attention_chunk(
+                        q=q_chunk,
+                        kv_flat=kv_flat,
+                        indices=indices_chunk_full[:, index_start:index_end],
+                        lens=lens_chunk,
+                        candidate_offset=index_start,
+                        scale=layer.scale,
+                        max_score=max_score,
+                        denom=denom,
+                        acc=subset_acc,
+                    )
+                finish_max = max_score
+                finish_denom = denom
+                finish_acc = subset_acc
 
             finish_sparse_mla_attention_with_sink(
-                max_score,
-                denom,
-                subset_acc,
+                finish_max,
+                finish_denom,
+                finish_acc,
                 layer.attn_sink,
                 output=output[token_start:token_end],
             )
@@ -867,6 +992,52 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
         if triton_sparse_mla_enabled:
             query_chunk_size = min(q.shape[0], triton_sparse_mla_query_chunk_size())
+            partial_topk_chunk_size = triton_sparse_mla_prefill_topk_chunk_size(
+                combined_topk_size=combined_topk,
+                compress_ratio=int(layer.compress_ratio),
+                request_count=chunk_size_const,
+            )
+            partial_part_size = min(partial_topk_chunk_size, 512)
+            partial_parts = (
+                (combined_topk + partial_part_size - 1) // partial_part_size
+                if combined_topk > partial_part_size
+                else 0
+            )
+            partial_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
+            if num_prefills == 1 and partial_parts > 1:
+                partial_specs.extend(
+                    [
+                        (
+                            (partial_parts, query_chunk_size, layer.num_heads),
+                            torch.float32,
+                        ),
+                        (
+                            (partial_parts, query_chunk_size, layer.num_heads),
+                            torch.float32,
+                        ),
+                        (
+                            (
+                                partial_parts,
+                                query_chunk_size,
+                                layer.num_heads,
+                                q.shape[-1],
+                            ),
+                            torch.float32,
+                        ),
+                        ((query_chunk_size, layer.num_heads), torch.float32),
+                        ((query_chunk_size, layer.num_heads), torch.float32),
+                        (
+                            (query_chunk_size, layer.num_heads, q.shape[-1]),
+                            torch.float32,
+                        ),
+                        ((query_chunk_size, layer.num_heads), torch.float32),
+                        ((query_chunk_size, layer.num_heads), torch.float32),
+                        (
+                            (query_chunk_size, layer.num_heads, q.shape[-1]),
+                            torch.float32,
+                        ),
+                    ]
+                )
             (
                 kv,
                 combined_indices_buffer,
@@ -874,6 +1045,7 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 max_score_buffer,
                 denom_buffer,
                 output_buffer,
+                *partial_state_buffers,
             ) = workspace_manager.get_simultaneous(
                 ((chunk_size_const, M, q.shape[-1]), torch.bfloat16),
                 ((max_query_chunk_tokens, combined_topk), torch.int32),
@@ -881,11 +1053,13 @@ class DeepseekV4FlashMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ((query_chunk_size, layer.num_heads), torch.float32),
                 ((query_chunk_size, layer.num_heads), torch.float32),
                 ((query_chunk_size, layer.num_heads, q.shape[-1]), torch.float32),
+                *partial_specs,
             )
             prefill_state_buffers = (
                 max_score_buffer,
                 denom_buffer,
                 output_buffer,
+                *partial_state_buffers,
             )
         else:
             (

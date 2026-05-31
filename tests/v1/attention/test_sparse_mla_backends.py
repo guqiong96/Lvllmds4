@@ -852,3 +852,282 @@ def test_triton_convert_returns_valid_counts():
     )
     assert isinstance(result_only, torch.Tensor)
     torch.testing.assert_close(result_only, result, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM12x only"
+)
+def test_sparse_mla_partial_state_merge_matches_single_pass_accumulate():
+    from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+        accumulate_indexed_sparse_mla_attention_chunk,
+        merge_sparse_mla_attention_states,
+    )
+
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(2026)
+    num_tokens, num_heads, head_dim = 5, 8, 64
+    num_candidates, split_at = 13, 6
+    kv_tokens = 31
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_flat = torch.randn(kv_tokens, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, kv_tokens, (num_tokens, num_candidates), device=device, dtype=torch.int32
+    )
+    indices[1, 3] = -1
+    indices[3, 9:] = -1
+    lens = torch.tensor([13, 12, 8, 9, 0], device=device, dtype=torch.int32)
+
+    single_max = torch.full(
+        (num_tokens, num_heads), float("-inf"), device=device, dtype=torch.float32
+    )
+    single_denom = torch.zeros_like(single_max)
+    single_acc = torch.zeros(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=single_max,
+        denom=single_denom,
+        acc=single_acc,
+    )
+
+    left_max = torch.full_like(single_max, float("-inf"))
+    left_denom = torch.zeros_like(single_denom)
+    left_acc = torch.zeros_like(single_acc)
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices[:, :split_at],
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=left_max,
+        denom=left_denom,
+        acc=left_acc,
+    )
+
+    right_max = torch.full_like(single_max, float("-inf"))
+    right_denom = torch.zeros_like(single_denom)
+    right_acc = torch.zeros_like(single_acc)
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices[:, split_at:],
+        lens=lens,
+        candidate_offset=split_at,
+        scale=scale,
+        max_score=right_max,
+        denom=right_denom,
+        acc=right_acc,
+    )
+
+    merged_max = torch.empty_like(single_max)
+    merged_denom = torch.empty_like(single_denom)
+    merged_acc = torch.empty_like(single_acc)
+    merge_sparse_mla_attention_states(
+        left_max,
+        left_denom,
+        left_acc,
+        right_max,
+        right_denom,
+        right_acc,
+        merged_max,
+        merged_denom,
+        merged_acc,
+    )
+
+    torch.testing.assert_close(merged_max, single_max, rtol=0, atol=0)
+    torch.testing.assert_close(merged_denom, single_denom, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(merged_acc, single_acc, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM12x only"
+)
+def test_sparse_mla_partial_state_accumulate_matches_single_pass_accumulate():
+    from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+        accumulate_indexed_sparse_mla_attention_chunk,
+        accumulate_indexed_sparse_mla_attention_partial_states,
+        merge_sparse_mla_attention_states,
+    )
+
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(2027)
+    num_tokens, num_heads, head_dim = 5, 8, 64
+    num_candidates, part_size = 14, 7
+    kv_tokens = 37
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_flat = torch.randn(kv_tokens, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, kv_tokens, (num_tokens, num_candidates), device=device, dtype=torch.int32
+    )
+    indices[0, 4] = -1
+    indices[2, 11:] = -1
+    lens = torch.tensor([14, 10, 11, 5, 0], device=device, dtype=torch.int32)
+
+    single_max = torch.full(
+        (num_tokens, num_heads), float("-inf"), device=device, dtype=torch.float32
+    )
+    single_denom = torch.zeros_like(single_max)
+    single_acc = torch.zeros(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=single_max,
+        denom=single_denom,
+        acc=single_acc,
+    )
+
+    partial_max = torch.empty(
+        2, num_tokens, num_heads, device=device, dtype=torch.float32
+    )
+    partial_denom = torch.empty_like(partial_max)
+    partial_acc = torch.empty(
+        2, num_tokens, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    accumulate_indexed_sparse_mla_attention_partial_states(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        part_size=part_size,
+        max_score=partial_max,
+        denom=partial_denom,
+        acc=partial_acc,
+    )
+
+    merged_max = torch.empty_like(single_max)
+    merged_denom = torch.empty_like(single_denom)
+    merged_acc = torch.empty_like(single_acc)
+    merge_sparse_mla_attention_states(
+        partial_max[0],
+        partial_denom[0],
+        partial_acc[0],
+        partial_max[1],
+        partial_denom[1],
+        partial_acc[1],
+        merged_max,
+        merged_denom,
+        merged_acc,
+    )
+
+    torch.testing.assert_close(merged_max, single_max, rtol=0, atol=0)
+    torch.testing.assert_close(merged_denom, single_denom, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(merged_acc, single_acc, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM12x only"
+)
+def test_sparse_mla_partial_state_multi_part_merge_matches_single_pass_accumulate():
+    from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+        accumulate_indexed_sparse_mla_attention_chunk,
+        accumulate_indexed_sparse_mla_attention_partial_states,
+        merge_sparse_mla_attention_states,
+    )
+
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(2028)
+    num_tokens, num_heads, head_dim = 5, 8, 64
+    num_candidates, part_size = 23, 5
+    kv_tokens = 53
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_flat = torch.randn(kv_tokens, head_dim, device=device, dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, kv_tokens, (num_tokens, num_candidates), device=device, dtype=torch.int32
+    )
+    indices[0, 4] = -1
+    indices[1, 17:] = -1
+    indices[3, 9:14] = -1
+    lens = torch.tensor([23, 17, 21, 16, 0], device=device, dtype=torch.int32)
+
+    single_max = torch.full(
+        (num_tokens, num_heads), float("-inf"), device=device, dtype=torch.float32
+    )
+    single_denom = torch.zeros_like(single_max)
+    single_acc = torch.zeros(
+        num_tokens, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    accumulate_indexed_sparse_mla_attention_chunk(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=single_max,
+        denom=single_denom,
+        acc=single_acc,
+    )
+
+    num_parts = cdiv(num_candidates, part_size)
+    partial_max = torch.empty(
+        num_parts, num_tokens, num_heads, device=device, dtype=torch.float32
+    )
+    partial_denom = torch.empty_like(partial_max)
+    partial_acc = torch.empty(
+        num_parts, num_tokens, num_heads, head_dim, device=device, dtype=torch.float32
+    )
+    accumulate_indexed_sparse_mla_attention_partial_states(
+        q=q,
+        kv_flat=kv_flat,
+        indices=indices,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        part_size=part_size,
+        max_score=partial_max,
+        denom=partial_denom,
+        acc=partial_acc,
+    )
+
+    merged_max = partial_max[0].clone()
+    merged_denom = partial_denom[0].clone()
+    merged_acc = partial_acc[0].clone()
+    scratch_max = torch.empty_like(single_max)
+    scratch_denom = torch.empty_like(single_denom)
+    scratch_acc = torch.empty_like(single_acc)
+    for part_idx in range(1, num_parts):
+        merge_sparse_mla_attention_states(
+            merged_max,
+            merged_denom,
+            merged_acc,
+            partial_max[part_idx],
+            partial_denom[part_idx],
+            partial_acc[part_idx],
+            scratch_max,
+            scratch_denom,
+            scratch_acc,
+        )
+        merged_max, scratch_max = scratch_max, merged_max
+        merged_denom, scratch_denom = scratch_denom, merged_denom
+        merged_acc, scratch_acc = scratch_acc, merged_acc
+
+    torch.testing.assert_close(merged_max, single_max, rtol=0, atol=0)
+    torch.testing.assert_close(merged_denom, single_denom, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(merged_acc, single_acc, rtol=1e-5, atol=1e-5)
