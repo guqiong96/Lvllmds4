@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -858,6 +859,74 @@ def test_running_long_prefill_leaves_budget_for_running_short_prefill():
     assert second_mixed.num_scheduled_tokens[short_prefill_req.request_id] == 25
 
 
+def test_running_long_prefill_leaves_budget_for_later_running_decode():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=2048,
+        max_num_seqs=2,
+        enable_chunked_prefill=True,
+    )
+    long_prefill_req = create_requests(
+        num_requests=1,
+        num_tokens=1000,
+        req_ids=["long_prefill"],
+    )[0]
+    short_req = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        req_ids=["short_then_decode"],
+    )[0]
+
+    scheduler.add_request(long_prefill_req)
+    first_chunk = scheduler.schedule()
+    assert first_chunk.num_scheduled_tokens[long_prefill_req.request_id] == 100
+    scheduler.update_from_output(
+        first_chunk,
+        ModelRunnerOutput(
+            req_ids=[long_prefill_req.request_id],
+            req_id_to_index={long_prefill_req.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.add_request(short_req)
+    while short_req.num_computed_tokens < short_req.num_prompt_tokens:
+        mixed_output = scheduler.schedule()
+        assert short_req.request_id in mixed_output.num_scheduled_tokens
+        sampled_token_ids = []
+        req_id_to_index = {}
+        for index, req_id in enumerate(mixed_output.num_scheduled_tokens):
+            req_id_to_index[req_id] = index
+            if req_id == short_req.request_id and (
+                short_req.num_computed_tokens
+                + mixed_output.num_scheduled_tokens[req_id]
+            ) >= short_req.num_prompt_tokens:
+                sampled_token_ids.append([0])
+            else:
+                sampled_token_ids.append([])
+        scheduler.update_from_output(
+            mixed_output,
+            ModelRunnerOutput(
+                req_ids=list(mixed_output.num_scheduled_tokens),
+                req_id_to_index=req_id_to_index,
+                sampled_token_ids=sampled_token_ids,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    assert long_prefill_req.num_computed_tokens < long_prefill_req.num_prompt_tokens
+    assert short_req.num_computed_tokens >= short_req.num_prompt_tokens
+
+    decode_mixed = scheduler.schedule()
+    assert decode_mixed.num_scheduled_tokens[long_prefill_req.request_id] == 6
+    assert decode_mixed.num_scheduled_tokens[short_req.request_id] == 1
+
+
 def test_mixed_decode_prefill_caps_mid_long_prefill_more_tightly():
     scheduler = create_scheduler(
         max_num_batched_tokens=100,
@@ -930,6 +999,85 @@ def test_mixed_decode_prefill_caps_very_long_prefill_more_tightly():
 
     assert mixed_output.num_scheduled_tokens[decode_req.request_id] == 1
     assert mixed_output.num_scheduled_tokens[very_long_prefill_req.request_id] == 6
+
+
+def test_scheduler_trace_records_per_step_scheduling_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    trace_path = tmp_path / "scheduler_trace.jsonl"
+    monkeypatch.setenv("VLLM_SCHEDULER_TRACE_PATH", str(trace_path))
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=512,
+        max_num_seqs=2,
+        enable_chunked_prefill=True,
+    )
+    decode_req = create_requests(num_requests=1, num_tokens=100, req_ids=["decode"])[0]
+    long_prefill_req = create_requests(
+        num_requests=1,
+        num_tokens=300,
+        req_ids=["long_prefill"],
+    )[0]
+
+    scheduler.add_request(decode_req)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[decode_req.request_id],
+            req_id_to_index={decode_req.request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.add_request(long_prefill_req)
+    scheduler.schedule()
+
+    trace_events = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(trace_events) == 2
+    assert trace_events[0]["step"] == 0
+    assert trace_events[1]["step"] == 1
+    assert trace_events[1]["token_budget_before_schedule"] == 100
+    assert trace_events[1]["waiting_request_count"] == 1
+    assert trace_events[1]["scheduled_requests"] == [
+        {
+            "request_id": "decode",
+            "phase": "decode",
+            "scheduled_tokens": 1,
+            "num_prompt_tokens": 100,
+            "num_computed_tokens_before": 100,
+            "num_tokens_with_spec": 101,
+            "num_output_placeholders": 0,
+            "remaining_prefill_tokens_before": 0,
+            "crosses_prefill_boundary": False,
+        },
+        {
+            "request_id": "long_prefill",
+            "phase": "prefill",
+            "scheduled_tokens": 25,
+            "num_prompt_tokens": 300,
+            "num_computed_tokens_before": 0,
+            "num_tokens_with_spec": 300,
+            "num_output_placeholders": 0,
+            "remaining_prefill_tokens_before": 300,
+            "crosses_prefill_boundary": False,
+        },
+    ]
+    assert trace_events[1]["running_requests_before_schedule"] == [
+        {
+            "request_id": "decode",
+            "phase": "decode",
+            "num_prompt_tokens": 100,
+            "num_computed_tokens_before": 100,
+            "remaining_prefill_tokens_before": 0,
+        }
+    ]
 
 
 def test_preempt_during_execution():

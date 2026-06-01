@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -98,6 +101,20 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self.scheduler_trace_path = envs.VLLM_SCHEDULER_TRACE_PATH
+        self.scheduler_trace_step = 0
+        if self.scheduler_trace_path:
+            trace_dir = os.path.dirname(self.scheduler_trace_path)
+            if trace_dir:
+                try:
+                    os.makedirs(trace_dir, exist_ok=True)
+                except OSError as err:
+                    logger.warning(
+                        "Failed to create scheduler trace directory %s: %s",
+                        trace_dir,
+                        err,
+                    )
+                    self.scheduler_trace_path = ""
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -343,6 +360,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         scheduled_running_reqs: list[Request],
         has_waiting_requests: bool = False,
+        has_pending_decode: bool = False,
     ) -> int:
         if (
             not self.scheduler_config.enable_chunked_prefill
@@ -350,8 +368,10 @@ class Scheduler(SchedulerInterface):
         ):
             return num_new_tokens
 
-        has_scheduled_decode = self._has_scheduled_decode(scheduled_running_reqs)
-        if not has_scheduled_decode and not has_waiting_requests:
+        has_decode_pressure = (
+            self._has_scheduled_decode(scheduled_running_reqs) or has_pending_decode
+        )
+        if not has_decode_pressure and not has_waiting_requests:
             return num_new_tokens
 
         remaining_prefill = request.num_prompt_tokens - request.num_computed_tokens
@@ -365,7 +385,7 @@ class Scheduler(SchedulerInterface):
         very_long_prefill_threshold = (
             self.max_num_scheduled_tokens * very_long_prefill_steps
         )
-        if has_scheduled_decode:
+        if has_decode_pressure:
             if remaining_prefill > very_long_prefill_threshold:
                 mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 16)
             else:
@@ -375,6 +395,85 @@ class Scheduler(SchedulerInterface):
         else:
             mixed_prefill_budget = max(1, (self.max_num_scheduled_tokens * 3) // 4)
         return min(num_new_tokens, mixed_prefill_budget)
+
+    @staticmethod
+    def _scheduler_trace_phase(request: Request) -> str:
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            return "prefill"
+        return "decode"
+
+    @classmethod
+    def _scheduler_trace_request_state(cls, request: Request) -> dict[str, Any]:
+        return {
+            "request_id": request.request_id,
+            "phase": cls._scheduler_trace_phase(request),
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_computed_tokens_before": request.num_computed_tokens,
+            "remaining_prefill_tokens_before": max(
+                request.num_prompt_tokens - request.num_computed_tokens, 0
+            ),
+        }
+
+    def _write_scheduler_trace(
+        self,
+        *,
+        scheduled_timestamp: float,
+        token_budget_before_schedule: int,
+        total_num_scheduled_tokens: int,
+        running_requests_before_schedule: tuple[Request, ...],
+        waiting_request_count: int,
+        skipped_waiting_request_count: int,
+        num_scheduled_tokens: dict[str, int],
+        preempted_reqs: list[Request],
+    ) -> None:
+        if not self.scheduler_trace_path:
+            return
+
+        scheduled_requests: list[dict[str, Any]] = []
+        for req_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            request_state = self._scheduler_trace_request_state(request)
+            computed_before = request.num_computed_tokens
+            request_state.update(
+                {
+                    "scheduled_tokens": scheduled_tokens,
+                    "num_tokens_with_spec": request.num_tokens_with_spec,
+                    "num_output_placeholders": request.num_output_placeholders,
+                    "crosses_prefill_boundary": (
+                        computed_before
+                        < request.num_prompt_tokens
+                        < computed_before + scheduled_tokens
+                    ),
+                }
+            )
+            scheduled_requests.append(request_state)
+
+        event = {
+            "step": self.scheduler_trace_step,
+            "timestamp": scheduled_timestamp,
+            "token_budget_before_schedule": token_budget_before_schedule,
+            "total_num_scheduled_tokens": total_num_scheduled_tokens,
+            "waiting_request_count": waiting_request_count,
+            "skipped_waiting_request_count": skipped_waiting_request_count,
+            "running_requests_before_schedule": [
+                self._scheduler_trace_request_state(request)
+                for request in running_requests_before_schedule
+            ],
+            "scheduled_requests": scheduled_requests,
+            "preempted_request_ids": [request.request_id for request in preempted_reqs],
+        }
+
+        try:
+            with open(self.scheduler_trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(event, separators=(",", ":")) + "\n")
+            self.scheduler_trace_step += 1
+        except OSError as err:
+            logger.warning(
+                "Failed to append scheduler trace to %s: %s",
+                self.scheduler_trace_path,
+                err,
+            )
+            self.scheduler_trace_path = ""
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -399,6 +498,10 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        token_budget_before_schedule = token_budget
+        running_requests_before_schedule = tuple(self.running)
+        waiting_request_count = len(self.waiting)
+        skipped_waiting_request_count = len(self.skipped_waiting)
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -444,12 +547,17 @@ class Scheduler(SchedulerInterface):
                 later_request.num_computed_tokens < later_request.num_prompt_tokens
                 for later_request in self.running[req_index + 1 :]
             )
+            has_pending_running_decode = any(
+                later_request.num_computed_tokens >= later_request.num_prompt_tokens
+                for later_request in self.running[req_index + 1 :]
+            )
             num_new_tokens = self._limit_mixed_decode_prefill_chunk(
                 request,
                 num_new_tokens,
                 scheduled_running_reqs,
                 bool(self.waiting or self.skipped_waiting)
                 or has_unscheduled_running_prefill,
+                has_pending_running_decode,
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -981,6 +1089,17 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+
+        self._write_scheduler_trace(
+            scheduled_timestamp=scheduled_timestamp,
+            token_budget_before_schedule=token_budget_before_schedule,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            running_requests_before_schedule=running_requests_before_schedule,
+            waiting_request_count=waiting_request_count,
+            skipped_waiting_request_count=skipped_waiting_request_count,
+            num_scheduled_tokens=num_scheduled_tokens,
+            preempted_reqs=preempted_reqs,
+        )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
