@@ -354,6 +354,39 @@ class Scheduler(SchedulerInterface):
             for request in requests
         )
 
+    def _very_long_prefill_threshold(self) -> int:
+        return self.max_num_scheduled_tokens * 4
+
+    def _is_very_long_prefill(
+        self,
+        request: Request,
+        num_computed_tokens: int | None = None,
+    ) -> bool:
+        if not self.scheduler_config.enable_chunked_prefill:
+            return False
+        if num_computed_tokens is None:
+            num_computed_tokens = request.num_computed_tokens
+        return (
+            request.num_prompt_tokens > self._very_long_prefill_threshold()
+            and num_computed_tokens < request.num_prompt_tokens
+        )
+
+    def _has_active_very_long_prefill(self) -> bool:
+        return any(self._is_very_long_prefill(request) for request in self.running)
+
+    def _has_waiting_requests_for_running_prefill(self, request: Request) -> bool:
+        if not (self.waiting or self.skipped_waiting):
+            return False
+        if not self._is_very_long_prefill(request):
+            return True
+        return any(
+            not self._is_very_long_prefill(waiting_request)
+            for waiting_request in self.waiting
+        ) or any(
+            not self._is_very_long_prefill(waiting_request)
+            for waiting_request in self.skipped_waiting
+        )
+
     def _limit_mixed_decode_prefill_chunk(
         self,
         request: Request,
@@ -381,10 +414,7 @@ class Scheduler(SchedulerInterface):
         # Very long prefills span many scheduling steps; a smaller chunk keeps
         # already-active decoders from seeing long inter-token gaps and leaves
         # room for short requests that arrive behind an active long prefill.
-        very_long_prefill_steps = 4
-        very_long_prefill_threshold = (
-            self.max_num_scheduled_tokens * very_long_prefill_steps
-        )
+        very_long_prefill_threshold = self._very_long_prefill_threshold()
         if has_decode_pressure:
             if remaining_prefill > very_long_prefill_threshold:
                 mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 16)
@@ -421,6 +451,9 @@ class Scheduler(SchedulerInterface):
         token_budget_before_schedule: int,
         total_num_scheduled_tokens: int,
         running_requests_before_schedule: tuple[Request, ...],
+        running_waiting_pressure_before_schedule: dict[str, bool],
+        waiting_requests_before_schedule: tuple[Request, ...],
+        skipped_waiting_requests_before_schedule: tuple[Request, ...],
         waiting_request_count: int,
         skipped_waiting_request_count: int,
         num_scheduled_tokens: dict[str, int],
@@ -458,6 +491,23 @@ class Scheduler(SchedulerInterface):
             "running_requests_before_schedule": [
                 self._scheduler_trace_request_state(request)
                 for request in running_requests_before_schedule
+            ],
+            "running_waiting_pressure_before_schedule": (
+                running_waiting_pressure_before_schedule
+            ),
+            "waiting_requests_before_schedule": [
+                {
+                    **self._scheduler_trace_request_state(request),
+                    "is_very_long_prefill": self._is_very_long_prefill(request),
+                }
+                for request in waiting_requests_before_schedule
+            ],
+            "skipped_waiting_requests_before_schedule": [
+                {
+                    **self._scheduler_trace_request_state(request),
+                    "is_very_long_prefill": self._is_very_long_prefill(request),
+                }
+                for request in skipped_waiting_requests_before_schedule
             ],
             "scheduled_requests": scheduled_requests,
             "preempted_request_ids": [request.request_id for request in preempted_reqs],
@@ -502,6 +552,19 @@ class Scheduler(SchedulerInterface):
         running_requests_before_schedule = tuple(self.running)
         waiting_request_count = len(self.waiting)
         skipped_waiting_request_count = len(self.skipped_waiting)
+        if self.scheduler_trace_path:
+            running_waiting_pressure_before_schedule = {
+                request.request_id: (
+                    self._has_waiting_requests_for_running_prefill(request)
+                )
+                for request in running_requests_before_schedule
+            }
+            waiting_requests_before_schedule = tuple(self.waiting)
+            skipped_waiting_requests_before_schedule = tuple(self.skipped_waiting)
+        else:
+            running_waiting_pressure_before_schedule = {}
+            waiting_requests_before_schedule = ()
+            skipped_waiting_requests_before_schedule = ()
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -555,7 +618,7 @@ class Scheduler(SchedulerInterface):
                 request,
                 num_new_tokens,
                 scheduled_running_reqs,
-                bool(self.waiting or self.skipped_waiting)
+                self._has_waiting_requests_for_running_prefill(request)
                 or has_unscheduled_running_prefill,
                 has_pending_running_decode,
             )
@@ -806,6 +869,14 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+
+                if (
+                    self._is_very_long_prefill(request, num_computed_tokens)
+                    and self._has_active_very_long_prefill()
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1095,6 +1166,13 @@ class Scheduler(SchedulerInterface):
             token_budget_before_schedule=token_budget_before_schedule,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             running_requests_before_schedule=running_requests_before_schedule,
+            running_waiting_pressure_before_schedule=(
+                running_waiting_pressure_before_schedule
+            ),
+            waiting_requests_before_schedule=waiting_requests_before_schedule,
+            skipped_waiting_requests_before_schedule=(
+                skipped_waiting_requests_before_schedule
+            ),
             waiting_request_count=waiting_request_count,
             skipped_waiting_request_count=skipped_waiting_request_count,
             num_scheduled_tokens=num_scheduled_tokens,
