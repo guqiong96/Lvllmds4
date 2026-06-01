@@ -14,7 +14,7 @@ def test_resolve_flashinfer_autotune_file_default_layout(
 ) -> None:
     fake_jit = SimpleNamespace(
         env=SimpleNamespace(
-            FLASHINFER_WORKSPACE_DIR=Path("/flashinfer-cache/0.6.11.post2/103a")
+            FLASHINFER_WORKSPACE_DIR=Path("/flashinfer-cache/0.6.12/103a")
         )
     )
     fake_flashinfer = SimpleNamespace(jit=fake_jit)
@@ -34,7 +34,7 @@ def test_resolve_flashinfer_autotune_file_default_layout(
     assert path == (
         tmp_path
         / "flashinfer_autotune_cache"
-        / "0.6.11.post2"
+        / "0.6.12"
         / "103a"
         / cache_hash
         / "autotune_configs.json"
