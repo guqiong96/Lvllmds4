@@ -72,6 +72,15 @@ def _fp32x2_to_fp8e4m3x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint16
     return Uint16(out)
 
 
+def _clamp_fp8_with_fmax(x: Float32, fp8_max: float) -> Float32:
+    lower = Float32(-fp8_max)
+    upper = Float32(fp8_max)
+    zero = Float32(0.0)
+    bounded = cute.arch.fmax(x, lower)
+    # cutlass-dsl 4.5.2 builds may not expose cute.arch.fmin.
+    return zero - cute.arch.fmax(zero - bounded, zero - upper)
+
+
 class SparseAttnCompressNormRopeStoreC4Kernel:
     min_scale = 1.0e-4
     rcp_ln2 = 1.4426950408889634
@@ -370,13 +379,9 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
                 inv_scale = _recast_val((Uint32(254) - ue8m0) << Uint32(23), Float32)
                 for pair in cutlass.range_constexpr(self.elems_per_lane // 2):
                     elem = const_expr(pair * 2)
-                    y0 = cute.arch.fmin(
-                        cute.arch.fmax(q[elem] * inv_scale, Float32(-self.fp8_max)),
-                        Float32(self.fp8_max),
-                    )
-                    y1 = cute.arch.fmin(
-                        cute.arch.fmax(q[elem + 1] * inv_scale, Float32(-self.fp8_max)),
-                        Float32(self.fp8_max),
+                    y0 = _clamp_fp8_with_fmax(q[elem] * inv_scale, self.fp8_max)
+                    y1 = _clamp_fp8_with_fmax(
+                        q[elem + 1] * inv_scale, self.fp8_max
                     )
                     packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
                     out_base = value_base + (elem_base + Int32(elem)).to(Int64)
@@ -1026,14 +1031,8 @@ class SparseAttnNormRopeStoreKernel:
                 bits = _recast_val(scale_raw, Uint32)
                 ue8m0 = ((bits + Uint32(0x7FFFFF)) >> Uint32(23)) & Uint32(0xFF)
                 inv_scale = _recast_val((Uint32(254) - ue8m0) << Uint32(23), Float32)
-                y0 = cute.arch.fmin(
-                    cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
-                )
-                y1 = cute.arch.fmin(
-                    cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
-                )
+                y0 = _clamp_fp8_with_fmax(q0 * inv_scale, self.fp8_max)
+                y1 = _clamp_fp8_with_fmax(q1 * inv_scale, self.fp8_max)
                 packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
                 out_base = value_base + (warp_id * self.quant_block + lane_id * 2).to(
                     Int64
