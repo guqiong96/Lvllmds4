@@ -1924,89 +1924,17 @@ class FusedMoE(PluggableLayer):
         return output_gpu
 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        prefill_stream = torch.cuda.Stream()
-        current_stream = torch.cuda.current_stream()
-        current_stream.synchronize()
-        output_gpu = torch.empty_like(hidden_states, dtype=self.moe_config.in_dtype, device=torch.cuda.current_device()) 
-        
-        DEBUG_LAYER = 0
-        if self.layer_id == DEBUG_LAYER:
-            hs_cpu = hidden_states.cpu()
-            ids_cpu = topk_ids.cpu()
-            w_cpu = topk_weights.cpu()
-            
-            output_cpu = torch.empty_like(hs_cpu, dtype=torch.float32)
-            self.lk_moe.cpu_prefill(
-                hs_cpu.size(0),
-                ids_cpu.size(1),
-                ids_cpu.data_ptr(),
-                w_cpu.data_ptr(),
-                hs_cpu.data_ptr(),
-                output_cpu.data_ptr(),
-            )
-            
-            self.lk_moe.gpu_prefill(
-                hidden_states.data_ptr(),
-                output_gpu.data_ptr(),
-                topk_ids.data_ptr(),
-                topk_weights.data_ptr(),
-                hidden_states.size(0),
-                topk_ids.size(1),
-                prefill_stream.cuda_stream,
-            )
-            current_stream.synchronize()
-            
-            gpu_out_cpu = output_gpu.float().cpu()
-            diff = (output_cpu - gpu_out_cpu).abs()
-            
-            qlen, hidden = output_cpu.shape
-            import numpy as np
-            np.set_printoptions(linewidth=200, threshold=2048, precision=4, suppress=True)
-            
-            # 摘要
-            token_max_diff = diff.max(dim=1).values
-            bad_tokens = (token_max_diff > 0.01).nonzero(as_tuple=True)[0]
-            print(f"[Layer{self.layer_id}] ({qlen},{hidden}) max_diff={diff.max():.4f} "
-                  f"cpu=[{output_cpu.min():.4f},{output_cpu.max():.4f}] "
-                  f"gpu=[{gpu_out_cpu.min():.4f},{gpu_out_cpu.max():.4f}] "
-                  f"bad_tokens={len(bad_tokens)}/{qlen}")
-            
-            if len(bad_tokens) > 0:
-                print(f"Bad token indices: {bad_tokens.tolist()}")
-                
-                # 打印前 10 个异常 token 的详情
-                for t in bad_tokens[:10]:
-                    t = t.item()
-                    # 该 token 选了哪些 expert
-                    experts = ids_cpu[t].tolist()
-                    weights = w_cpu[t].tolist()
-                    # diff 最大的 hidden dims
-                    top_vals, top_idx = diff[t].topk(8)
-                    
-                    print(f"\nT{t}: experts={experts} weights={[f'{w:.3f}' for w in weights]}")
-                    print(f"  Top diffs: ", end="")
-                    for i in range(8):
-                        h = top_idx[i].item()
-                        print(f"H{h}(cpu={output_cpu[t,h]:.4f} gpu={gpu_out_cpu[t,h]:.4f} diff={top_vals[i]:.4f}) ", end="")
-                    print()
-                    
-                    # 打印完整的 hidden 数组（可选，如果太多可以注释掉）
-                    # print(f"T{t:4d} CPU:", output_cpu[t].numpy())
-                    # print(f"T{t:4d} GPU:", gpu_out_cpu[t].numpy())
-            
-            return output_gpu
-         
-         
+        output = torch.empty_like(hidden_states) 
         self.lk_moe.gpu_prefill(
             hidden_states.data_ptr(),
-            output_gpu.data_ptr(),
+            output.data_ptr(),
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
             hidden_states.size(0),
             topk_ids.size(1),
-            prefill_stream.cuda_stream,
-        )  
-        return output_gpu
+            torch.cuda.current_stream().cuda_stream,
+        ) 
+        return output
 
 
 # This is a temporary forwarding method which will be removed/modified layer.
