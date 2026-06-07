@@ -49,6 +49,9 @@ rm -rf "$TMP_DIR"
 rm -f "$PROJECT_DIR/$REPAIRED_FILE"
 cd "$PROJECT_DIR"
 
+FINAL_NAME="dist/lvllmds4-${VLLM_VERSION_OVERRIDE}-cp312-cp312-manylinux_2_34_x86_64.whl"
+mv "$FINAL_WHL" "$FINAL_NAME"
+
 echo ""
-echo "Stripped wheel: $(ls -lh $FINAL_WHL | awk '{print $5}')"
+echo "Wheel: $(ls -lh $FINAL_NAME | awk '{print $5}')"
 echo "Usage: VLLM_VERSION_OVERRIDE=2.2.1 bash build_lvllmds4.sh"
