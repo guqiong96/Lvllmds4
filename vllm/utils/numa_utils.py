@@ -176,6 +176,12 @@ def _get_numactl_args(
     dp_local_rank: int | None = None,
     process_kind: str = "worker",
 ) -> str | None:
+    from vllm.envs import is_lk_moe_feature_enabled, is_numa_interleave_enabled
+ 
+    if is_lk_moe_feature_enabled():
+        if is_numa_interleave_enabled():
+            return "--interleave=all"
+        return None
     parallel_config = vllm_config.parallel_config
     if not parallel_config.numa_bind:
         return None
