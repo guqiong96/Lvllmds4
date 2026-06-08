@@ -346,6 +346,12 @@ def _get_numactl_worker_args(
     parallel_config, local_rank: int, dp_local_rank: int | None = None
 ) -> str:
     """Compute the numactl args for a single TP/PP worker subprocess."""
+    from vllm.envs import is_lk_moe_feature_enabled, is_numa_interleave_enabled
+ 
+    if is_lk_moe_feature_enabled():
+        if is_numa_interleave_enabled():
+            return "--interleave=all"
+        return None
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
     numa_node = _get_numa_node(parallel_config, gpu_index)
     cpu_binding = _get_cpu_binding(parallel_config, gpu_index, [numa_node])

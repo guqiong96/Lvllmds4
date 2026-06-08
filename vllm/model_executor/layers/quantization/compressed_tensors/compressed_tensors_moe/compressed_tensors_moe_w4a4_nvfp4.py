@@ -64,6 +64,12 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.platforms import current_platform
+        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
+            
         layer.num_experts = num_experts
         layer.params_dtype = params_dtype
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
@@ -76,6 +82,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 hidden_size // 2,
                 requires_grad=False,
                 dtype=torch.uint8,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -89,6 +96,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=torch.uint8,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -103,6 +111,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.group_size,
                 dtype=torch.float8_e4m3fn,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -119,6 +128,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.group_size,
                 dtype=torch.float8_e4m3fn,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -130,7 +140,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
         # Weight Global Scales
         w13_weight_scale_2 = torch.nn.Parameter(
-            torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
+            torch.empty(num_experts, w13_num_shards, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_global_scale", w13_weight_scale_2)
@@ -140,7 +150,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight_scale_2, extra_weight_attrs)
 
         w2_weight_scale_2 = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            torch.empty(num_experts, dtype=torch.float32, device=device), requires_grad=False
         )
         layer.register_parameter("w2_weight_global_scale", w2_weight_scale_2)
         extra_weight_attrs.update(
@@ -169,6 +179,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
@@ -244,10 +257,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
-        raise ValueError(
-            f"{self.__class__.__name__} uses the new modular kernel initialization "
-            "logic. This function should not be called."
-        )
+        pass
+        # raise ValueError(
+        #     f"{self.__class__.__name__} uses the new modular kernel initialization "
+        #     "logic. This function should not be called."
+        # )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         return make_nvfp4_moe_quant_config(

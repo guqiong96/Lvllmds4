@@ -169,6 +169,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.platforms import current_platform
+        device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu" 
         intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
 
         # Will transpose the loaded weight along the
@@ -188,6 +193,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     intermediate_size_per_partition,
                 ),
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -203,6 +209,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     intermediate_size_per_partition,
                 ),
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -240,6 +247,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_groups_w13=num_groups_w13,
                 ),
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -256,6 +264,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_groups_w2=num_groups_w2,
                 ),
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -280,6 +289,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -291,6 +301,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -302,6 +313,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -313,6 +325,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -323,6 +336,9 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return
         # Process weights using the shared oracle infrastructure
         is_flashinfer = self.wna16_backend == WNA16MoEBackend.FLASHINFER_TRTLLM
         (
