@@ -1504,7 +1504,7 @@ class FusedMoE(PluggableLayer):
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import CompressedTensorsW4A4Nvfp4MoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4MoEMethod
-            from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+            from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
             from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
             find_weight = False  
             with torch.no_grad():
@@ -1529,7 +1529,7 @@ class FusedMoE(PluggableLayer):
                     self._process_bf6_fp16()
                     find_weight = True
                     
-                if isinstance(self.quant_method, CompressedTensorsW4A4Nvfp4MoEMethod):
+                if isinstance(self.quant_method, CompressedTensorsW4A4Nvfp4MoEMethod) or isinstance(self.quant_method, ModelOptNvFp4FusedMoE):
                     self._process_nvfp4()
                     find_weight = True
                     
@@ -1567,15 +1567,15 @@ class FusedMoE(PluggableLayer):
         if self.use_ep:
             return self.ep_size, self.ep_rank, torch.cuda.current_device()
         return self.tp_size, self.tp_rank, torch.cuda.current_device()
-                   
-     
+    
     def _get_quant_params(self, w13_weight, w13_weight_scale, pack_ratio):
         unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
         
         groupN = w13_weight.shape[1] // w13_weight_scale.shape[1]
         groupK = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
-        
         return groupN, groupK
+                   
+     
     def _process_wna16(self, strategy: str): 
         
         is_transposed = self.quant_method.kernel_backend  != "Flashinfer"
@@ -1590,14 +1590,15 @@ class FusedMoE(PluggableLayer):
             w2_weight = self.w2_weight_packed.cpu().contiguous().view(torch.uint8) 
             w13_scale = self.w13_weight_scale.cpu().contiguous()
             w2_scale = self.w2_weight_scale.cpu().contiguous() 
-     
+    
+        
         group_size = self.quant_method.group_size        # 32
         num_bits = self.quant_method.num_bits            # 4
         packed_factor = self.quant_method.packed_factor  # 8 （bit)
          
  
         weights_per_container = packed_factor // num_bits  # 2 
-         
+        
         groupN, groupK = self._get_quant_params(w13_weight, w13_scale, weights_per_container)
         
         w13_weight_ptr = w13_weight.data_ptr()
@@ -1665,8 +1666,7 @@ class FusedMoE(PluggableLayer):
         
         
         groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 1)
-        
-      
+
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
         w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
@@ -1837,6 +1837,7 @@ class FusedMoE(PluggableLayer):
             0,
             0,
         )
+         
          
          
     def _get_max_num_seqs(self) -> int:
