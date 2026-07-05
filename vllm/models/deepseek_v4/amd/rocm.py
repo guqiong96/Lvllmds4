@@ -606,10 +606,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
-        kv_workspace: torch.Tensor | None = None,
     ) -> None:
-        del kv_workspace
-
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )

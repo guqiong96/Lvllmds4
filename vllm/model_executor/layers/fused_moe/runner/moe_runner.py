@@ -56,7 +56,7 @@ from vllm.utils.torch_utils import (
 
 from vllm.logger import init_logger
 logger = init_logger(__name__)
-import threading
+
 
 def register_layer_for_moe_forward_op(
     vllm_config: VllmConfig,

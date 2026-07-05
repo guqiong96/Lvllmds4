@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import numpy as np
 import torch
 
 import vllm.envs as envs

@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import json
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -106,20 +103,6 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
-        self.scheduler_trace_path = envs.VLLM_SCHEDULER_TRACE_PATH
-        self.scheduler_trace_step = 0
-        if self.scheduler_trace_path:
-            trace_dir = os.path.dirname(self.scheduler_trace_path)
-            if trace_dir:
-                try:
-                    os.makedirs(trace_dir, exist_ok=True)
-                except OSError as err:
-                    logger.warning(
-                        "Failed to create scheduler trace directory %s: %s",
-                        trace_dir,
-                        err,
-                    )
-                    self.scheduler_trace_path = ""
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -437,23 +420,6 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
-        token_budget_before_schedule = token_budget
-        running_requests_before_schedule = tuple(self.running)
-        waiting_request_count = len(self.waiting)
-        skipped_waiting_request_count = len(self.skipped_waiting)
-        if self.scheduler_trace_path:
-            running_waiting_pressure_before_schedule = {
-                request.request_id: (
-                    self._has_waiting_requests_for_running_prefill(request)
-                )
-                for request in running_requests_before_schedule
-            }
-            waiting_requests_before_schedule = tuple(self.waiting)
-            skipped_waiting_requests_before_schedule = tuple(self.skipped_waiting)
-        else:
-            running_waiting_pressure_before_schedule = {}
-            waiting_requests_before_schedule = ()
-            skipped_waiting_requests_before_schedule = ()
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -515,22 +481,6 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
-            has_unscheduled_running_prefill = any(
-                later_request.num_computed_tokens < later_request.num_prompt_tokens
-                for later_request in self.running[req_index + 1 :]
-            )
-            has_pending_running_decode = any(
-                later_request.num_computed_tokens >= later_request.num_prompt_tokens
-                for later_request in self.running[req_index + 1 :]
-            )
-            num_new_tokens = self._limit_mixed_decode_prefill_chunk(
-                request,
-                num_new_tokens,
-                scheduled_running_reqs,
-                self._has_waiting_requests_for_running_prefill(request)
-                or has_unscheduled_running_prefill,
-                has_pending_running_decode,
-            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -842,14 +792,6 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                if (
-                    self._is_very_long_prefill(request, num_computed_tokens)
-                    and self._has_active_very_long_prefill()
-                ):
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -901,9 +843,6 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    num_new_tokens = self._limit_mixed_decode_prefill_chunk(
-                        request, num_new_tokens, scheduled_running_reqs
-                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.

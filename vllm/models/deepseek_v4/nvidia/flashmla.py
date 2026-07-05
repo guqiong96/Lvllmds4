@@ -57,38 +57,6 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
-def _sparse_mla_prefill_workspace_bounds(
-    seq_lens_cpu: torch.Tensor,
-    gather_lens_cpu: torch.Tensor,
-    compress_ratio: int,
-    swa_only: bool,
-) -> tuple[int, int]:
-    if seq_lens_cpu.numel() == 0:
-        return 0, 0
-
-    max_gather_len = int(gather_lens_cpu.max().item())
-    if swa_only:
-        return 0, max_gather_len
-
-    compressed_region_size = int((seq_lens_cpu // compress_ratio).max().item())
-    return compressed_region_size, compressed_region_size + max_gather_len
-
-
-def _sparse_mla_prefill_gather_len_upper_bound(
-    *,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-    window_size: int,
-) -> tuple[int, int]:
-    max_query_chunk_tokens = max(1, min(max_model_len, max_num_batched_tokens))
-    max_prefix_len = max(max_model_len - max_query_chunk_tokens, 0)
-    max_gather_len = max_query_chunk_tokens + min(
-        max_prefix_len,
-        max(window_size - 1, 0),
-    )
-    return max_query_chunk_tokens, max_gather_len
-
-
 _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK = 256
 _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK = 1152
 
@@ -326,7 +294,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
-        kv_workspace: torch.Tensor | None = None,
     ) -> None:
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
@@ -376,7 +343,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 output=output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
-                kv_workspace=kv_workspace,
             )
         if num_decodes > 0:
             self._forward_decode(
@@ -827,7 +793,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     attn_metadata.block_table[:num_decodes],
                     block_size,
                     is_valid,
-                    global_topk_indices=local_topk_indices,
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
@@ -930,7 +895,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         output: torch.Tensor,
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
-        kv_workspace: torch.Tensor | None = None,
     ) -> None:
         swa_only = attn_metadata is None
 
@@ -1148,7 +1112,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            query_tokens = query_end - query_start
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[

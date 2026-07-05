@@ -23,7 +23,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v4.common.ops import (
-    dequantize_and_gather_k_cache,
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
