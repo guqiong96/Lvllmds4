@@ -58,7 +58,7 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.envs import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_resident_experts, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_in_profile_run
+from vllm.envs import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_in_profile_run
 
 if is_lk_moe_feature_enabled():
     import  lk_moe  
@@ -166,8 +166,6 @@ class FusedMoE(PluggableLayer):
             self.check_nan_in_output = False
         
         self.has_gate_proj = is_act_and_mul
-            
-        self.expert_cache_size = get_gpu_resident_experts()
 
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
@@ -1620,7 +1618,6 @@ class FusedMoE(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1685,7 +1682,6 @@ class FusedMoE(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1722,7 +1718,6 @@ class FusedMoE(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1775,7 +1770,6 @@ class FusedMoE(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1820,7 +1814,6 @@ class FusedMoE(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1948,6 +1941,10 @@ class FusedMoE(PluggableLayer):
             topk_ids.size(1),
             torch.cuda.current_stream().cuda_stream,
         ) 
+        if self.check_nan_in_output:
+            bad_mask = torch.isnan(output) | torch.isinf(output)
+            if bad_mask.any():
+                output.masked_fill_(bad_mask, 0.0)
         return output
 
 
