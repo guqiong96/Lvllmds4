@@ -120,9 +120,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             device = "cpu"
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
@@ -278,8 +278,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             return
         # Allow for accessing weights and scales in standard way.
         w13 = layer.w13_weight

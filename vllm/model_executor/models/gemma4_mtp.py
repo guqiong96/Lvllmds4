@@ -44,7 +44,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .gemma4 import Gemma4MLP, _get_text_config
@@ -279,11 +278,19 @@ class Gemma4MTPDecoderLayer(nn.Module):
             else config.head_dim
         )
 
+        use_k_eq_v = is_full_attention and getattr(config, "attention_k_eq_v", False)
+        if use_k_eq_v:
+            num_kv_heads = getattr(
+                config, "num_global_key_value_heads", config.num_key_value_heads
+            )
+        else:
+            num_kv_heads = config.num_key_value_heads
+
         self.self_attn = Gemma4MTPAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
@@ -404,44 +411,6 @@ class Gemma4MultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.normalizer
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        params_dict.update(dict(self.named_buffers()))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -494,6 +463,10 @@ class Gemma4MTP(nn.Module):
             "pre_projection.": "model.pre_projection.",
             "post_projection.": "model.post_projection.",
         },
+        orig_to_new_stacked={
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -545,6 +518,10 @@ class Gemma4MTP(nn.Module):
         else:
             self.masked_embedding = None
 
+        draft_cfg = vllm_config.speculative_config.draft_model_config
+        gen_cfg = draft_cfg.try_get_generation_config()
+        self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -589,11 +566,15 @@ class Gemma4MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         if self.masked_embedding is not None:
-            return self.masked_embedding(
+            logits = self.masked_embedding(
                 hidden_states,
                 self._get_full_lm_head_weight(),
             )
-        return self.logits_processor(self.lm_head, hidden_states)
+        else:
+            logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and self._suppress_token_ids:
+            logits[:, self._suppress_token_ids] = -float("inf")
+        return logits
 
     def get_top_tokens(
         self,

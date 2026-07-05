@@ -6,18 +6,36 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
-import hashlib
-from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.compilation.caching import aot_compile_hash_factors
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
+    deepseek_v4_mhc_warmup,
+)
+from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    resolve_flashinfer_autotune_file,
+    write_flashinfer_autotune_cache,
+)
+from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+    _DEEPSEEK_V4_SPARSE_MLA_BACKENDS,
+    deepseek_v4_sparse_mla_attention_warmup,
+    flashinfer_sparse_mla_decode_autotune_warmup,
+)
+from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
+from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+    sparse_mla_triton_warmup_if_needed,
+)
+from vllm.model_executor.warmup.v1_block_table_warmup import (
+    warm_v1_block_table_kernels,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -30,12 +48,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
-    {
-        "V4_FLASHMLA_SPARSE",
-        "DEEPSEEK_SPARSE_SWA",
-    }
-)
+# Backend names that mark a DSv4 sparse-MLA attn group as live. Shared with
+# flashinfer_sparse_mla_warmup so the two warmup gates cannot drift on a
+# backend rename (the old local "V4_FLASHMLA_SPARSE" was renamed
+# "FLASHMLA_SPARSE_DSV4" upstream and only kept matching via DEEPSEEK_SPARSE_SWA).
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
 # Cap warmup at the largest single-chunk prefill the scheduler will ever
 # issue (max_num_batched_tokens). 8192 covers the canonical SM12x serve
@@ -43,12 +59,12 @@ _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
 # value via _clamp_warmup_tokens at the call site, smaller caps clamp
 # down naturally.
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
-# Steady-state MTP decode shapes to warm. Keep this bounded to the edge
-# deployment range we expect to optimize; warming the scheduler's raw
-# max_num_seqs (often 1024) can consume multiple GiB of temporary workspace
-# on long-context SM12x serves before the first request.
+# Steady-state MTP decode shapes to warm. Keep this bounded to high-concurrency
+# SM12x gates while still avoiding the scheduler's raw max_num_seqs (often 1024),
+# which can consume multiple GiB of temporary workspace on long-context serves
+# before the first request.
 _DEEPSEEK_V4_MTP_UNIFORM_DECODE_WARMUP_REQUESTS = (1, 2, 4, 8, 16, 24, 32)
-_DEEPSEEK_V4_MTP_UNIFORM_DECODE_MAX_WARMUP_REQUESTS = 32
+_DEEPSEEK_V4_MTP_UNIFORM_DECODE_MAX_WARMUP_REQUESTS = 256
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,
     64,
@@ -111,13 +127,89 @@ def _deepseek_v4_mtp_uniform_decode_warmup_requests(
         _DEEPSEEK_V4_MTP_UNIFORM_DECODE_MAX_WARMUP_REQUESTS,
     )
     candidates = sorted(
-        set(_DEEPSEEK_V4_MTP_UNIFORM_DECODE_WARMUP_REQUESTS)
-        | {max_warmup_reqs}
+        set(_DEEPSEEK_V4_MTP_UNIFORM_DECODE_WARMUP_REQUESTS) | {max_warmup_reqs}
     )
     return tuple(reqs for reqs in candidates if reqs <= max_warmup_reqs)
 
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
+    # The DeepSeek-V4 slot-mapping warmup runs on BOTH GPU model runners. The V2
+    # runner exposes ``block_tables`` + ``input_buffers``; the V1 runner exposes
+    # ``input_batch.block_table`` + ``query_start_loc``/``positions``. Dispatch on
+    # whichever interface the runner provides (V1 is our production default) so
+    # the warmup never silently no-ops and reintroduces first-request JIT.
+    block_tables = getattr(runner, "block_tables", None)
+    if block_tables is not None:
+        _deepseek_v4_slot_mapping_warmup_v2(runner, block_tables)
+    elif getattr(runner, "input_batch", None) is not None:
+        _deepseek_v4_slot_mapping_warmup_v1(runner)
+
+
+def _deepseek_v4_slot_mapping_warmup_v2(
+    runner: "GPUModelRunner", block_tables: Any
+) -> None:
+    max_tokens = getattr(runner, "max_num_tokens", 1)
+    input_buffers = getattr(runner, "input_buffers", None)
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=runner.device)
+
+    # Snapshot the runner buffers we mutate so warmup never leaks state into
+    # the first real request.
+    saved_query_start_loc_gpu: torch.Tensor | None = None
+    query_start_loc_buf = None
+    if input_buffers is not None:
+        query_start_loc_buf = input_buffers.query_start_loc
+        saved_query_start_loc_gpu = query_start_loc_buf[:2].clone()
+
+    try:
+        for requested_tokens in _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS:
+            num_tokens = _clamp_warmup_tokens(requested_tokens, max_tokens)
+            if num_tokens <= 0:
+                continue
+
+            positions_source = torch.arange(
+                num_tokens, dtype=torch.int64, device=runner.device
+            )
+            if query_start_loc_buf is not None:
+                query_start_loc_buf[:2].copy_(
+                    torch.tensor(
+                        [0, num_tokens], dtype=torch.int32, device=runner.device
+                    )
+                )
+                query_start_loc = query_start_loc_buf[:2]
+            else:
+                query_start_loc = torch.tensor(
+                    [0, num_tokens], dtype=torch.int32, device=runner.device
+                )
+
+            positions_buf = (
+                None if input_buffers is None else input_buffers.positions[:num_tokens]
+            )
+            if positions_buf is not None:
+                saved_positions: torch.Tensor | None = positions_buf.clone()
+                positions_buf.copy_(positions_source)
+                positions = positions_buf
+            else:
+                saved_positions = None
+                positions = positions_source
+
+            try:
+                block_tables.compute_slot_mappings(
+                    idx_mapping,
+                    query_start_loc,
+                    positions,
+                    num_tokens_padded=num_tokens,
+                )
+            finally:
+                if saved_positions is not None:
+                    assert positions_buf is not None
+                    positions_buf.copy_(saved_positions)
+    finally:
+        if saved_query_start_loc_gpu is not None:
+            assert query_start_loc_buf is not None
+            query_start_loc_buf[:2].copy_(saved_query_start_loc_gpu)
+
+
+def _deepseek_v4_slot_mapping_warmup_v1(runner: "GPUModelRunner") -> None:
     max_tokens = getattr(runner, "max_num_tokens", 1)
     block_table = runner.input_batch.block_table
 
@@ -149,9 +241,9 @@ def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
                 )
 
             if hasattr(runner, "positions"):
-                saved_positions: torch.Tensor | None = (
-                    runner.positions[:num_tokens].clone()
-                )
+                saved_positions: torch.Tensor | None = runner.positions[
+                    :num_tokens
+                ].clone()
                 runner.positions[:num_tokens].copy_(positions_source)
                 positions = runner.positions[:num_tokens]
             else:
@@ -197,7 +289,10 @@ def _deepseek_v4_structured_output_bitmask_warmup(
             )
             input_batch = SimpleNamespace(req_ids=req_ids)
             apply_grammar_bitmask(
-                SchedulerOutput.make_empty(), grammar_output, input_batch, logits
+                SchedulerOutput.make_empty(),
+                grammar_output,
+                input_batch,  # type: ignore[arg-type]
+                logits,
             )
 
 
@@ -235,6 +330,7 @@ def _run_deepseek_v4_mtp_spec_decode_warmup_kernels(
     vocab_size: int,
     block_size: int,
     max_model_len: int,
+    hidden_size: int,
 ) -> None:
     from vllm.v1.sample.logits_processor import LogitsProcessors
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -351,6 +447,257 @@ def _run_deepseek_v4_mtp_spec_decode_warmup_kernels(
         sampling_metadata=sampling_metadata,
     )
 
+    # rejection_greedy_sample_kernel: the metadata above is all_random=True, so
+    # rejection_sample skips its greedy branch and that kernel stays JIT-cold. Run
+    # a second pass with greedy metadata (fresh instance, not a mutation) so the
+    # greedy kernel compiles here instead of on the first greedy request.
+    try:
+        import dataclasses
+
+        greedy_metadata = dataclasses.replace(
+            sampling_metadata,
+            all_greedy=True,
+            all_random=False,
+            temperature=torch.zeros(num_reqs, dtype=torch.float32, device=device),
+        )
+        rejection_sample(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=[num_spec_tokens] * num_reqs,
+            max_spec_len=num_spec_tokens,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            draft_probs=draft_probs,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            sampling_metadata=greedy_metadata,
+        )
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.warning(
+            "DeepSeek V4 MTP greedy rejection-sample warmup skipped: %s", exc
+        )
+
+    # _mtp_shared_head_rmsnorm_kernel: the MTP shared-head RMSNorm is not driven by
+    # any dummy run, so it JITs on the first MTP step. Direct-launch it (its only
+    # compile key is hidden_size, so one call covers the model).
+    try:
+        from vllm.models.deepseek_v4.common.ops.fused_mtp_input_rmsnorm import (
+            mtp_shared_head_rmsnorm,
+        )
+
+        hs = torch.randn(
+            num_reqs * num_sampled_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        norm_w = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+        mtp_shared_head_rmsnorm(hs, norm_w, 1e-6)
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        logger.warning("DeepSeek V4 MTP shared-head RMSNorm warmup skipped: %s", exc)
+
+
+def _deepseek_v4_indexed_d512_split_prefill_warmup(runner: "GPUModelRunner") -> None:
+    """Force-compile the DeepSeek-V4 D512-split sparse-MLA prefill kernels.
+
+    The split path (``_use_indexed_d512_split_prefill`` ->
+    ``accumulate_indexed_d512_split_sparse_mla_attention``) bottoms out in three
+    plain ``@triton.jit`` kernels whose compile key is the constexpr set --
+    chiefly ``num_candidates`` (= the per-chunk ``combined_topk``) plus the
+    workspace buffer strides. ``combined_topk`` is 128-aligned
+    (``_SPARSE_PREFILL_TOPK_ALIGNMENT``) and the split path is gated to
+    ``[256, 1152]`` (``_is_indexed_d512_split_topk``), so the complete
+    specialization set is the eight widths {256, 384, ..., 1152}. The kernels
+    never see ``compress_ratio``, so one warm per width covers cr=4 and cr=128.
+
+    Without this, the first long-prefill request JIT-compiles these kernels
+    inside the engine step (~20s), parking EngineCore in shm_broadcast and
+    surfacing as a "sample_tokens RPC timed out" wedge (PR #41834).
+
+    Triton compilation is data-independent, so synthetic zero tensors compile
+    the same cubin a real request uses -- provided every constexpr matches. Two
+    non-obvious constexprs (verified against the live jit_monitor compile key):
+    the per-chunk ``scores``/``indices`` workspaces are sized to that chunk's own
+    ``combined_topk`` (contiguous at width C, so ``stride_scores_h == C`` and
+    ``stride_indices_t == C`` -- NOT a slice of a wider buffer), and the prefill
+    ``q`` buffer is padded to the FP8-decode head count (``padded_heads``), so
+    ``stride_q_t == padded_heads * head_dim`` even though the kernel reads only
+    ``n_local_heads``. The synthetic tensors mirror both.
+
+    Scope: only the split path (``combined_topk <= 1152``) is warmed. DeepSeek-V4
+    -Flash caps ``combined_topk`` at ``sparse_prefill_combined_topk_size(
+    index_topk=512, 128) = 640`` for every context length, so that is complete
+    coverage. A variant whose ``combined_topk`` can exceed 1152 routes onto the
+    chunked path (extra split-stride and merge kernels) which is not pre-warmed
+    here; that case is warned at startup rather than left as a silent gap.
+    """
+    if not (
+        envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP
+        and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
+    ):
+        return
+
+    try:
+        from vllm.models.deepseek_v4.common.ops.cache_utils import (
+            sparse_prefill_combined_topk_size,
+        )
+        from vllm.models.deepseek_v4.nvidia.flashmla import (
+            _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK,
+            _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK,
+            DeepseekV4FlashMLAAttention,
+        )
+        from vllm.v1.attention.backends.mla.sparse_mla_env import (
+            is_triton_sparse_mla_enabled_for_platform,
+            triton_sparse_mla_query_chunk_size,
+        )
+        from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+            accumulate_indexed_d512_split_sparse_mla_attention,
+        )
+    except ImportError as exc:
+        # The early gate above already confirmed the warmup is requested, so a
+        # failed import here is not a benign "kernels unavailable" case — it is
+        # usually a renamed symbol (it silently disabled this warmup for weeks).
+        # Surface it at WARNING so a future rename does not no-op the warmup.
+        logger.warning(
+            "Skipping DeepSeek V4 D512-split prefill warmup: a required symbol "
+            "failed to import (%s). The split kernels are likely present but a "
+            "helper was renamed; the first long prefill will JIT them mid-inference.",
+            exc,
+        )
+        return
+
+    try:
+        if not is_triton_sparse_mla_enabled_for_platform():
+            return
+        if (
+            getattr(runner, "max_model_len", 0)
+            < envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
+        ):
+            return
+
+        # The split kernel never sees compress_ratio, so any cr in (4, 128)
+        # layer yields identical strides; the first one is representative.
+        layer = None
+        for module in runner.get_model().modules():
+            if isinstance(
+                module, DeepseekV4FlashMLAAttention
+            ) and module.compress_ratio in (4, 128):
+                layer = module
+                break
+        if layer is None:
+            return
+
+        head_dim = int(layer.head_dim)
+        if head_dim != 512:
+            return
+        num_heads = int(layer.n_local_heads)
+        window_size = max(1, int(layer.window_size))
+        device = layer.attn_sink.device
+
+        # The width fed to the split kernels at runtime is the per-request
+        # combined_topk (combined_indices.shape[-1]), and it is NOT bounded by the
+        # static `topk_bound + window_size`. For the C4 indexer layers
+        # (compress_ratio=4) that expression IS the width (~640 for DSv4-Flash:
+        # indexer top-k 512 + window 128). But the C128A layer (compress_ratio=128)
+        # uses a context-dependent `effective_topk` (_c128a_effective_topk_width):
+        # a 128-aligned ceiling of `max_pos // compress_ratio` that GROWS with the
+        # request's context length up to the split ceiling. So a long-context
+        # request sweeps widths 768/896/1024/1152, not just <=640 (observed: all 8
+        # widths 256..1152 launched on a 60k-token / mnbt=512 request). The old
+        # `min(ceiling, topk_bound+window)` cap (640) therefore left 768..1152 to
+        # JIT on the first long request (PR #23 / lennytinkeredapps,
+        # max_model_len=1M + mnbt=512). Warm the WHOLE split range so no split-path
+        # width can JIT in production; the runtime workspace already accommodates
+        # the full range (a 60k request at width 1152 runs correctly). The extra
+        # widths cost a few seconds of one-time startup compile — the warmup's
+        # purpose.
+        c4_static_combined_topk = sparse_prefill_combined_topk_size(
+            DeepseekV4FlashMLAAttention._prefill_workspace_topk_bound(layer),
+            window_size,
+        )
+        # Variants whose static C4 width alone already exceeds the split ceiling
+        # never use the split path (they route to the chunked path, which is not
+        # pre-warmed here); the C128A layer can also exceed it at extreme context.
+        if c4_static_combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK:
+            logger.warning(
+                "DeepSeek V4 D512 prefill: static C4 combined_topk is %d (> %d); "
+                "this config routes to the chunked-prefill path, whose kernels are "
+                "NOT pre-warmed and may JIT on the first long prefill.",
+                c4_static_combined_topk,
+                _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK,
+            )
+        max_topk = _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
+        topk_widths = list(
+            range(_INDEXED_D512_SPLIT_PREFILL_MIN_TOPK, max_topk + 1, 128)
+        )
+        if not topk_widths:
+            return
+
+        # The real prefill q buffer is padded to the FP8-decode head count; the
+        # split kernel reads only n_local_heads, but stride_q_t (a constexpr in
+        # the compile key) reflects the padded width, so match it.
+        padded_heads = int(
+            getattr(layer, "padded_heads", 0)
+            or DeepseekV4FlashMLAAttention.get_padded_num_q_heads(num_heads)
+        )
+        # T sizes only the launch grid -- the cubin is T-independent -- so keep
+        # it small to bound the transient footprint.
+        num_tokens = max(1, min(triton_sparse_mla_query_chunk_size(), 32))
+
+        logger.info(
+            "Warming up DeepSeek V4 D512-split sparse-MLA prefill kernels for "
+            "combined_topk widths=%s (heads=%d, padded_q_heads=%d).",
+            topk_widths,
+            num_heads,
+            padded_heads,
+        )
+
+        # Throwaway tensors -- never the shared workspace, so warmup can't grow
+        # or leak steady-state memory. q/kv/state are width-independent; scores
+        # and indices are contiguous at each per-chunk width so their constexpr
+        # strides (stride_scores_h == width, stride_indices_t == width) match the
+        # runtime per-chunk workspace exactly.
+        q = torch.zeros(
+            (num_tokens, padded_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        kv_flat = torch.zeros((max_topk, head_dim), dtype=torch.bfloat16, device=device)
+        max_score = torch.zeros(
+            (num_tokens, num_heads), dtype=torch.float32, device=device
+        )
+        denom = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+        acc = torch.zeros(
+            (num_tokens, num_heads, head_dim), dtype=torch.float32, device=device
+        )
+        lens = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
+
+        for width in topk_widths:
+            # indices=0 (valid row) + lens=width keep every candidate active so
+            # the full kernel body, including the tl.dot MMA, compiles rather
+            # than an early-return stub.
+            indices = torch.zeros((num_tokens, width), dtype=torch.int32, device=device)
+            scores = torch.zeros(
+                (num_tokens, num_heads, width), dtype=torch.float32, device=device
+            )
+            lens.fill_(width)
+            accumulate_indexed_d512_split_sparse_mla_attention(
+                q=q,
+                kv_flat=kv_flat,
+                indices=indices,
+                lens=lens,
+                scale=layer.scale,
+                scores=scores,
+                max_score=max_score,
+                denom=denom,
+                acc=acc,
+            )
+        torch.accelerator.synchronize()
+    except Exception as exc:  # noqa: BLE001 - warmup must never break startup
+        # Warn (not debug): a swallowed failure here silently leaves the split
+        # kernels uncompiled, so the first long prefill pays the JIT stall again.
+        logger.warning(
+            "DeepSeek V4 D512-split prefill warmup skipped after error "
+            "(first long prefill may JIT in-inference): %s",
+            exc,
+        )
+
 
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
@@ -415,6 +762,12 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
         # Do not synthesize multi-request prefill here: that dummy shape
         # overflows the CUTeDSL KV-gather workspace on SM12x. Revisit only
         # with a real buffer-sizing fix for that warmup path.
+
+    # The prefill dummies above never drive the C128A indexer, so the
+    # D512-split prefill kernels stay uncompiled until the first long request
+    # (PR #41834 wedge). Compile them directly with synthetic inputs.
+    _deepseek_v4_indexed_d512_split_prefill_warmup(runner)
+
     query_len = getattr(runner, "uniform_decode_query_len", 0)
     for num_reqs in uniform_decode_reqs:
         runner._dummy_run(
@@ -442,36 +795,40 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
                 vocab_size=vocab_size,
                 block_size=block_size,
                 max_model_len=runner.max_model_len,
+                hidden_size=runner.model_config.get_hidden_size(),
             )
         torch.accelerator.synchronize()
 
 
-def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
-    factors = aot_compile_hash_factors(runner.vllm_config)
-    return hashlib.sha256(str(factors).encode()).hexdigest()
-
-
-def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
-    override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
-    if override_dir:
-        root = Path(override_dir).expanduser()
-    else:
-        from flashinfer.jit import env as flashinfer_jit_env
-
-        flashinfer_workspace = flashinfer_jit_env.FLASHINFER_WORKSPACE_DIR
-        root = (
-            Path(envs.VLLM_CACHE_ROOT)
-            / "flashinfer_autotune_cache"
-            / flashinfer_workspace.parent.name
-            / flashinfer_workspace.name
-        )
-
-    output_dir = root / _flashinfer_autotune_cache_hash(runner)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / "autotune_configs.json"
-
-
 def kernel_warmup(worker: "Worker"):
+    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+        minimax_m3_msa_warmup,
+    )
+
+    # Pooling models do not use the generation slot-mapping path.
+    if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
+        warm_v1_block_table_kernels(
+            getattr(worker.model_runner, "device", torch.device("cuda")),
+            worker.scheduler_config.max_num_batched_tokens,
+        )
+    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+
+    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+    # layer per token; warm them across token sizes first so the first real
+    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    deepseek_v4_mhc_warmup(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+    )
+
+    # Run next so input-prep kernels JIT against pristine runner state.
+    sparse_mla_triton_warmup_if_needed(worker)
+    flashinfer_sparse_mla_decode_autotune_warmup(worker)
+    deepseek_v4_sparse_mla_attention_warmup(worker)
+
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
         envs.VLLM_USE_DEEP_GEMM
@@ -482,6 +839,8 @@ def kernel_warmup(worker: "Worker"):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    minimax_m3_msa_warmup(worker)
 
     _deepseek_v4_sparse_mla_attention_warmup(worker)
     _deepseek_v4_request_prep_warmup(worker)
@@ -527,11 +886,8 @@ def kernel_warmup(worker: "Worker"):
             create_mixed_batch=True,
         )
 
-
-# TODO: remove once FlashInfer upstream fixes the persistent file cache
-# to resolve collisions like `use_8x4_sf_layout=True/False`, which causes
-# invalid tactics to be chosen
-_FLASHINFER_USE_PERSISTENT_CACHE = False
+    if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
+        cutedsl_warmup()
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
@@ -550,7 +906,20 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
-    if not _FLASHINFER_USE_PERSISTENT_CACHE:
+    use_persistent_cache = True
+
+    deepep_a2a_backends = {
+        "deepep_high_throughput",
+        "deepep_low_latency",
+        "deepep_v2",
+    }
+    if runner.vllm_config.parallel_config.all2all_backend in deepep_a2a_backends:
+        # DeepEP dispatch/combine can timeout when only rank 0
+        # performs autotune and falls behind other ranks.
+        # Thus we skip persistent cache in this case.
+        use_persistent_cache = False
+
+    if not use_persistent_cache:
         with torch.inference_mode(), fi_utils.autotune():
             runner._dummy_run(
                 num_tokens=runner.scheduler_config.max_num_batched_tokens,
@@ -563,7 +932,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     world = get_world_group()
     is_leader = world.rank_in_group == 0
 
-    cache_path = _resolve_flashinfer_autotune_file(runner)
+    cache_path = resolve_flashinfer_autotune_file(runner)
     if is_leader:
         logger.info("Using FlashInfer autotune cache file: %s", cache_path)
 
@@ -599,9 +968,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             "Falling back to default tactics."
         )
     else:
-        if not is_leader and world.local_rank == 0:
-            with open(cache_path, "wb") as f:
-                f.write(tune_results)
+        write_flashinfer_autotune_cache(cache_path, tune_results)
         world.barrier()
         from flashinfer.autotuner import AutoTuner
 

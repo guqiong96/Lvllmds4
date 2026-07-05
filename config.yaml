@@ -1,4 +1,4 @@
-model: "/home/guqiong/Models/DeepSeek-V4-Flash"
+model: "/home/guqiong/Models/DeepSeek-V4-Flash-DSpark"
 host: "0.0.0.0"
 port: 8070
 tensor-parallel-size: 2
@@ -7,7 +7,7 @@ max-model-len: 12000
 gpu-memory-utilization: 0.95
 trust-remote-code: true
 tokenizer-mode: "auto"
-served-model-name: "DeepSeek-V4-Flash"
+served-model-name: "DeepSeek-V4-Flash-DSpark"
 compilation_config.cudagraph_mode: "FULL_DECODE_ONLY"
 enable_prefix_caching: true
 enable-chunked-prefill: true
@@ -40,5 +40,6 @@ tokenizer-mode: "deepseek_v4"
 tool-call-parser: "deepseek_v4"     
 reasoning-parser: "deepseek_v4"
 # speculative-config: '{"num_speculative_tokens": 2,"method": "deepseek_mtp"}'
+# speculative-config: '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}'
 
 

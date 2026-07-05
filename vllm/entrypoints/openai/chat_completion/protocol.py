@@ -30,6 +30,8 @@ from vllm.entrypoints.openai.engine.protocol import (
     StructuralTagResponseFormat,
     ToolCall,
     UsageInfo,
+    validate_structural_tag_response_format,
+    validate_structured_outputs_structural_tag,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -63,6 +65,22 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    reasoning_content: str | None = None
+
+    @model_validator(mode="after")
+    def _populate_reasoning_content_alias(self) -> "ChatMessage":
+        if self.reasoning_content is None and self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if len(data.get("tool_calls", [])) == 0:
+            data.pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
@@ -181,6 +199,10 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class DeepSeekThinkingParam(OpenAIBaseModel):
+    type: Literal["enabled", "disabled"] = "enabled"
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -224,6 +246,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "faster responses and fewer tokens used on reasoning in a response. "
             "Note that 'max' is specific to the DeepSeek V4 series and is not "
             "part of the standard OpenAI API specification."
+        ),
+    )
+    thinking: DeepSeekThinkingParam | None = None
+    deepseek_v4_sampling_override: bool = Field(
+        default=True,
+        description=(
+            "Apply DeepSeek V4 official sampling defaults when thinking is "
+            "enabled. This only affects the DeepSeek V4 family and can be "
+            "disabled per request."
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
@@ -373,6 +404,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    return_token_offsets: bool | None = Field(
+        default=False,
+        description=(
+            "If true, return char-level (start, end) offsets for each "
+            "token relative to the tokenized source string in the "
+            "`token_offsets` field of the rendered response. Only "
+            "supported on the `/v1/completions/render` and "
+            "`/v1/chat/completions/render` endpoints; ignored on regular "
+            "generation endpoints. Honored only for Fast (Rust-backed) "
+            "tokenizers; otherwise `token_offsets` is null. For chat "
+            "requests, offsets are relative to the templated prompt "
+            "string (after applying the chat template). Multimodal "
+            "inputs and pre-tokenized inputs always yield null."
+        ),
+    )
     return_prompt_text: bool | None = Field(
         default=None,
         description=(
@@ -380,6 +426,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "prompt string produced by chat templating. In streaming mode it "
             "is sent only on the first chunk. This is useful for inspecting "
             "exactly what was fed into the model."
+        ),
+    )
+
+    return_assistant_tokens_mask: bool = Field(
+        default=False,
+        description=(
+            "If true, the /render response will include an "
+            "``assistant_tokens_mask`` field — a per-token list of 0/1 "
+            "values indicating which tokens were assistant-generated. "
+            "Requires the chat template to use ``{% generation %}`` "
+            "tags.  When the template does not support it, "
+            "``assistant_tokens_mask`` will be ``null``."
         ),
     )
 
@@ -496,6 +554,64 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 extra_kwargs,
             ),
             media_io_kwargs=self.media_io_kwargs,
+            return_assistant_tokens_mask=bool(self.return_assistant_tokens_mask),
+        )
+
+    def _is_deepseek_v4_model(self, model_config: ModelConfig | None = None) -> bool:
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) == "deepseek_v4":
+            return True
+
+        architectures = getattr(hf_config, "architectures", None) or ()
+        if any("deepseekv4" in str(arch).replace("_", "").lower()
+               for arch in architectures):
+            return True
+
+        model = (self.model or "").lower().replace("_", "-")
+        return "deepseek-v4" in model
+
+    def apply_chat_template_kwargs(
+        self,
+        chat_template_kwargs: dict[str, Any],
+        *,
+        model_config: ModelConfig | None = None,
+    ) -> dict[str, Any]:
+        """Apply request-level DeepSeek API compatibility knobs.
+
+        DeepSeek's OpenAI-compatible API exposes ``thinking`` as a top-level
+        request field, while vLLM's DeepSeek tokenizer consumes it as a chat
+        template kwarg. Keep the translation at the protocol boundary so the
+        tokenizer and reasoning parser see the same effective state.
+        """
+        chat_template_kwargs = dict(chat_template_kwargs)
+        if not self._is_deepseek_v4_model(model_config):
+            return chat_template_kwargs
+
+        if self.thinking is not None:
+            enabled = self.thinking.type == "enabled"
+            chat_template_kwargs["thinking"] = enabled
+            chat_template_kwargs["enable_thinking"] = enabled
+        elif (
+            "thinking" not in chat_template_kwargs
+            and "enable_thinking" not in chat_template_kwargs
+        ):
+            chat_template_kwargs["thinking"] = True
+            chat_template_kwargs["enable_thinking"] = True
+
+        return chat_template_kwargs
+
+    def _use_deepseek_v4_sampling_override(self) -> bool:
+        return self.deepseek_v4_sampling_override
+
+    @staticmethod
+    def _is_thinking_enabled(
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> bool:
+        if chat_template_kwargs is None:
+            return False
+        return bool(
+            chat_template_kwargs.get("thinking")
+            or chat_template_kwargs.get("enable_thinking")
         )
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -515,6 +631,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             needs_detokenization=bool(self.echo and not self.return_token_ids),
             max_total_tokens_param="max_model_len",
             max_output_tokens_param=max_output_tokens_param,
+            return_token_offsets=bool(self.return_token_offsets),
         )
 
     # Default sampling parameters for chat completion requests
@@ -548,6 +665,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
+        *,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        model_config: ModelConfig | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -571,6 +691,33 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+
+        if (
+            self._is_deepseek_v4_model(model_config)
+            and self._use_deepseek_v4_sampling_override()
+            and self._is_thinking_enabled(chat_template_kwargs)
+        ):
+            temperature = self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            top_p = self._DEFAULT_SAMPLING_PARAMS["top_p"]
+            top_k = self._DEFAULT_SAMPLING_PARAMS["top_k"]
+            min_p = self._DEFAULT_SAMPLING_PARAMS["min_p"]
+            presence_penalty = 0.0
+            frequency_penalty = 0.0
+        else:
+            presence_penalty = self.presence_penalty or 0.0
+            frequency_penalty = self.frequency_penalty or 0.0
+
+        # Merge server-default stop_token_ids (e.g., model-specific tokens
+        # like </call> for gpt-oss) with any request-specified ones
+        stop_token_ids = self.stop_token_ids
+        default_stop_ids = default_sampling_params.get("stop_token_ids")
+        if default_stop_ids:
+            if not stop_token_ids:
+                stop_token_ids = list(default_stop_ids)
+            else:
+                stop_token_ids = list(
+                    dict.fromkeys([*stop_token_ids, *default_stop_ids])
+                )
 
         prompt_logprobs = self.prompt_logprobs
         if prompt_logprobs is None and self.echo:
@@ -614,8 +761,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
             top_p=top_p,
@@ -623,7 +770,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
             ignore_eos=self.ignore_eos,
@@ -670,6 +817,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "'json_schema' field must be provided.",
                     parameter="response_format",
                 )
+
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
 
         return data
 
@@ -754,6 +904,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "You can only either use constraints for structured outputs "
                 "or tools, not both.",
             )
+        validate_structured_outputs_structural_tag(structured_outputs_kwargs)
         return data
 
     @model_validator(mode="before")
@@ -949,6 +1100,8 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     temperature: float | None = 0.7
     top_p: float | None = 1.0
     user: str | None = None
+    tool_choice: Literal["none"] | None = "none"
+    include_reasoning: bool = True
 
     # vLLM extensions
     best_of: int | None = None
@@ -979,6 +1132,16 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
                 "Batch chat completions do not support beam search. "
                 "Please set `use_beam_search` to False."
             )
+        response_format = data.get("response_format")
+        rf_type = (
+            response_format.get("type")
+            if isinstance(response_format, dict)
+            else getattr(response_format, "type", None)
+        )
+        if rf_type == "structural_tag":
+            validate_structural_tag_response_format(response_format)
+        if (structured_outputs := data.get("structured_outputs")) is not None:
+            validate_structured_outputs_structural_tag(structured_outputs)
         n = data.get("n", 1)
         if n is not None and n != 1:
             raise ValueError(

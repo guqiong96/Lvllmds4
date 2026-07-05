@@ -39,10 +39,19 @@ class FixFunctionalizationPass(VllmInductorPass):
         count = 0
 
         rope_targets = [torch.ops._C.rotary_embedding.default]
+        fused_deepseek_v4_mla_targets = []
 
         if hasattr(torch.ops.vllm, "rocm_aiter_triton_rotary_embedding"):
             rope_targets.append(
                 torch.ops.vllm.rocm_aiter_triton_rotary_embedding.default
+            )
+        if hasattr(torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"):
+            fused_deepseek_v4_mla_targets.append(
+                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.default
+            )
+        if hasattr(torch.ops.vllm, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"):
+            fused_deepseek_v4_mla_targets.append(
+                torch.ops.vllm.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.default
             )
 
         for node in graph.nodes:
@@ -181,6 +190,19 @@ class FixFunctionalizationPass(VllmInductorPass):
                     2: "key",
                 }
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif at_target in fused_deepseek_v4_mla_targets:
+                if (
+                    hasattr(
+                        torch.ops._C,
+                        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+                    )
+                    and at_target
+                    == torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.default  # noqa: E501
+                ):
+                    mutated_args = {1: "q_out", 2: "k_cache"}
+                else:
+                    mutated_args = {1: "q", 2: "k_cache"}
+                self.defunctionalize(graph, node, mutated_args)
             elif (
                 hasattr(torch.ops.vllm, "fused_rope_unified_mla_kv_cache_update")
                 and at_target
@@ -276,9 +298,11 @@ class FixFunctionalizationPass(VllmInductorPass):
         """
         Replace mutated getitem users of the auto-functionalized node with the
         mutated arguments.
-        :param node: The auto-functionalized node
-        :param mutated_args: The mutated arguments, indexed by getitem index.
-        If the value of an arg is a string, `node.kwargs[arg]` is used.
+
+        Args:
+            node: The auto-functionalized node
+            mutated_args: The mutated arguments, indexed by getitem index.
+                If the value of an arg is a string, `node.kwargs[arg]` is used.
         """
         for idx, user in self.getitem_users(node).items():
             # Some functionalized nodes may return both a result at getitem[0]
@@ -317,10 +341,11 @@ class FixFunctionalizationPass(VllmInductorPass):
         as node.kwargs cannot be used.
         See https://github.com/pytorch/pytorch/blob/a00faf440888ffb724bad413f329a49e2b6388e7/torch/_inductor/lowering.py#L351
 
-        :param graph: Graph to insert the defunctionalized node into
-        :param node: The auto-functionalized node to defunctionalize
-        :param args: If we cannot use kwargs, specify args directly.
-        If an arg is a string, `node.kwargs[arg]` is used.
+        Args:
+            graph: Graph to insert the defunctionalized node into
+            node: The auto-functionalized node to defunctionalize
+            args: If we cannot use kwargs, specify args directly.
+                If an arg is a string, `node.kwargs[arg]` is used.
         """  # noqa: E501
         assert is_func(node, auto_functionalized), (
             f"node must be auto-functionalized, is {node} instead"

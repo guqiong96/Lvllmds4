@@ -20,9 +20,7 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     elif kv_cache.dim() == 4:
         num_blocks, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
     else:
-        raise ValueError(
-            f"Expected 3D or 4D kv_cache, got {kv_cache.dim()} dimensions"
-        )
+        raise ValueError(f"Expected 3D or 4D kv_cache, got {kv_cache.dim()} dimensions")
     if num_kv_heads != 1:
         raise ValueError(f"Expected one KV head, got {num_kv_heads}")
 
@@ -61,8 +59,8 @@ def _fp8_mqa_logits_kernel(
     cu_seqlen_ks_ptr,
     cu_seqlen_ke_ptr,
     logits_ptr,
-    num_q: tl.constexpr,
-    seq_len_kv: tl.constexpr,
+    num_q,
+    seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qm: tl.constexpr,
@@ -72,7 +70,7 @@ def _fp8_mqa_logits_kernel(
     stride_kd: tl.constexpr,
     stride_wm: tl.constexpr,
     stride_wh: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -194,8 +192,8 @@ def _fp8_paged_mqa_logits_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -215,7 +213,7 @@ def _fp8_paged_mqa_logits_kernel(
     stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -251,7 +249,7 @@ def _fp8_paged_mqa_logits_kernel(
 
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     scale = tl.load(
-        scale_ptr + block_idx * stride_sb + block_offset[None, :] * stride_ss,
+        scale_ptr + block_idx.to(tl.int64) * stride_sb + block_offset[None, :] * stride_ss,
         mask=context_mask,
         other=0.0,
     )
@@ -270,7 +268,7 @@ def _fp8_paged_mqa_logits_kernel(
             ).to(tl.float32)
             k = tl.load(
                 kv_ptr
-                + block_idx[:, :, None] * stride_kvb
+                + block_idx[:, :, None].to(tl.int64) * stride_kvb
                 + block_offset[None, :, None] * stride_kvs
                 + d[None, None, :] * stride_kvd,
                 mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
@@ -304,8 +302,8 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -325,7 +323,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
-    stride_lm: tl.constexpr,
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -375,7 +373,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     )
 
     scale = tl.load(
-        scale_ptr + block_idx * stride_sb + block_offset * stride_ss,
+        scale_ptr + block_idx.to(tl.int64) * stride_sb + block_offset * stride_ss,
         mask=context_mask,
         other=0.0,
     )
@@ -398,7 +396,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
             ).to(tl.float32)
             k = tl.load(
                 kv_ptr
-                + block_idx[None, :] * stride_kvb
+                + block_idx[None, :].to(tl.int64) * stride_kvb
                 + block_offset[None, :] * stride_kvs
                 + d[:, None] * stride_kvd,
                 mask=context_mask[None, :] & (d[:, None] < head_dim),
@@ -618,10 +616,10 @@ def _tf32_hc_prenorm_gemm_kernel(
     stride_xk: tl.constexpr,
     stride_fnn: tl.constexpr,
     stride_fnk: tl.constexpr,
-    stride_outs: tl.constexpr,
+    stride_outs,
     stride_outm: tl.constexpr,
     stride_outn: tl.constexpr,
-    stride_sqs: tl.constexpr,
+    stride_sqs,
     stride_sqm: tl.constexpr,
     NUM_SPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,

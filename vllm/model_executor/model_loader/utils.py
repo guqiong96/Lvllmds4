@@ -20,6 +20,7 @@ from vllm.model_executor.layers.attention import (
     MLAAttention,
     MMEncoderAttention,
 )
+from vllm.model_executor.layers.hpc import HpcModule
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -30,6 +31,7 @@ from vllm.model_executor.model_loader.reload import (
 )
 from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm.tracing import instrument
+from vllm.utils.mem_utils import release_device_memory_under_pressure
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -99,9 +101,9 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
     for _, module in model.named_modules():
-        if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+        if isinstance(module, RoutedExperts) and not getattr(module, "process_lk_moe_already_called", False):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -112,7 +114,10 @@ def process_weights_after_loading(
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
-        if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+            # Repacking transients above can leave large amounts of memory in
+            # the caching allocator, which starves the OS on UMA devices.
+            release_device_memory_under_pressure(target_device)
+        if isinstance(module, RoutedExperts) and not getattr(module, "process_lk_moe_already_called", False):
             module.clean_weights_after_loading() 
             setattr(module, "process_lk_moe_already_called", True)
 
@@ -127,6 +132,15 @@ def process_weights_after_loading(
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
 
+    # Process HPC modules (HpcRopeNorm, etc.) that rely on
+    # process_weights_after_loading being called from the model's
+    # load_weights(). When using DummyModelLoader (e.g. profiling or
+    # sleep/wake_up reload), the model's load_weights() is not called, so we
+    # must handle HPC modules here generically.
+    for _, module in model.named_modules():
+        if isinstance(module, HpcModule):
+            module.process_weights_after_loading(model)
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":
@@ -135,8 +149,8 @@ def process_weights_after_loading(
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer: 
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+    if isinstance(module, RoutedExperts) and not module.is_gpu_resident_layer: 
         yield module
         return
     if target_device.type == "cpu":
@@ -160,7 +174,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
 
     finally:
-        if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer:  
+        if isinstance(module, RoutedExperts) and not module.is_gpu_resident_layer:  
             return
         use_pin_memory = (
             is_pin_memory_available()
@@ -298,6 +312,6 @@ def configure_quant_config(
 
         # pass mappings by reference to quant_config
         if hf_to_vllm_mapper is not None:
-            quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
+            quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_unstacked_mapper())
         if packed_mapping is not None:
             quant_config.packed_modules_mapping = packed_mapping

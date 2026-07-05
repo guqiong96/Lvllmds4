@@ -64,10 +64,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
         from vllm.platforms import current_platform
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             device = "cpu"
             
         layer.num_experts = num_experts
@@ -179,8 +179,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             return
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.

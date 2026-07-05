@@ -60,10 +60,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
         from vllm.platforms import current_platform
         device = torch.cuda.current_device() if current_platform.is_cuda_alike() else "cpu"
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             device = "cpu"
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
@@ -104,6 +104,21 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             num_groups_w2 = num_groups_w13 = 1
             self.group_size = -1
         else:
+            if hidden_size % self.group_size != 0:
+                raise ValueError(
+                    "CompressedTensors WNA16 MoE requires hidden_size "
+                    f"({hidden_size}) to be divisible by group_size "
+                    f"({self.group_size})."
+                )
+            if intermediate_size_per_partition % self.group_size != 0:
+                raise ValueError(
+                    "CompressedTensors WNA16 MoE with static group scales "
+                    "requires the MoE intermediate size per tensor-parallel "
+                    f"partition ({intermediate_size_per_partition}) to be "
+                    f"divisible by group_size ({self.group_size}). Scale "
+                    "groups would otherwise cross TP shard boundaries; use a "
+                    "compatible TP size or enable expert parallelism."
+                )
             num_groups_w2 = w2_scales_size // self.group_size
             num_groups_w13 = hidden_size // self.group_size
 
@@ -192,8 +207,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+        if isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer:
             return
         # Reconfigure packed weights and scales to match moe_wna16 format
         layer.w13_weight_packed = torch.nn.Parameter(
