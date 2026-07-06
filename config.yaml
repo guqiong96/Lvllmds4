@@ -3,7 +3,7 @@ host: "0.0.0.0"
 port: 8070
 tensor-parallel-size: 2
 #pipeline-parallel-size: 2 
-max-model-len: 12000
+max-model-len: 96000
 gpu-memory-utilization: 0.95
 trust-remote-code: true
 tokenizer-mode: "auto"
@@ -11,9 +11,9 @@ served-model-name: "DeepSeek-V4-Flash-DSpark"
 compilation_config.cudagraph_mode: "FULL_DECODE_ONLY"
 enable_prefix_caching: true
 enable-chunked-prefill: true
-max_num_batched_tokens: 8192
+max_num_batched_tokens: 4096
 dtype: "bfloat16"
-max_num_seqs: 4
+max_num_seqs: 2
 compilation_config.mode: "VLLM_COMPILE"
 enable-auto-tool-choice: true
 # mamba-ssm-cache-dtype: "float16"
@@ -40,6 +40,6 @@ tokenizer-mode: "deepseek_v4"
 tool-call-parser: "deepseek_v4"     
 reasoning-parser: "deepseek_v4"
 # speculative-config: '{"num_speculative_tokens": 2,"method": "deepseek_mtp"}'
-# speculative-config: '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}'
+speculative-config: '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"greedy"}'
 
 

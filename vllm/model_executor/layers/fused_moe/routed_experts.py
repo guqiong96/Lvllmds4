@@ -1451,6 +1451,7 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1515,6 +1516,7 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1551,6 +1553,7 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1603,6 +1606,7 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1647,6 +1651,7 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1669,11 +1674,11 @@ class RoutedExperts(PluggableLayer):
         if vllm_config.speculative_config is not None and vllm_config.speculative_config.num_speculative_tokens > 0:
             batch_size = vllm_config.scheduler_config.max_num_seqs * (
                 1 + vllm_config.speculative_config.num_speculative_tokens
-            ) * 2
+            )
         else:
-            batch_size = vllm_config.scheduler_config.max_num_seqs * 2
+            batch_size = vllm_config.scheduler_config.max_num_seqs
         
-        batch_size = min(batch_size, 512)
+        batch_size = min(batch_size, 32)
         
         return batch_size
          
@@ -1690,34 +1695,7 @@ class RoutedExperts(PluggableLayer):
                 dtype=torch.float32,
                 requires_grad=False
             ).contiguous()
-         
-    def _find_best_graph_index(self, total_tokens: int) -> int:
-        if not hasattr(RoutedExperts, 'cuda_graphs') or not RoutedExperts.cuda_graphs:
-            raise ValueError("No CUDA graphs initialized.")
-        
-        cuda_graphs = RoutedExperts.cuda_graphs
-        
-        low, high = 0, len(cuda_graphs) - 1
-        best_index = len(cuda_graphs) - 1  
-        
-        while low <= high:
-            mid = (low + high) // 2
-            if cuda_graphs[mid] >= total_tokens:
-                best_index = mid
-                high = mid - 1
-            else:
-                low = mid + 1
-         
-        if best_index >= len(cuda_graphs):
-            best_index = len(cuda_graphs) - 1
-             
-        if cuda_graphs[best_index] < total_tokens:
-            raise ValueError(f"No suitable CUDA graph found for {total_tokens} tokens. "
-                            f"Maximum available buffer size: {cuda_graphs[-1]}")
-        
-        return best_index
-     
-        
+                 
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self.lk_moe.cpu_decode(
