@@ -264,14 +264,17 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+        weight_use_create_name = isinstance(layer, RoutedExperts) and not layer.is_gpu_resident_layer
+           
         return make_nvfp4_moe_quant_config(
             backend=self.nvfp4_backend,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w13_scale_2=layer.w13_weight_scale_2,
-            w2_scale_2=layer.w2_weight_scale_2,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
+            w13_scale_2=layer.w13_weight_scale_2 if not weight_use_create_name else layer.w13_weight_global_scale,
+            w2_scale_2=layer.w2_weight_scale_2 if not weight_use_create_name else layer.w2_weight_global_scale,
+            a13_scale=layer.w13_input_scale if not weight_use_create_name else layer.w13_input_global_scale,
+            a2_scale=layer.w2_input_scale if not weight_use_create_name else layer.w2_input_global_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
 

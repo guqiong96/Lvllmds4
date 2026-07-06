@@ -1324,6 +1324,41 @@ class RoutedExperts(PluggableLayer):
         if tensor is not None:
             tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
             
+    def _do_process_weights_after_loading(self) -> bool:
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import CompressedTensorsWNA16MarlinMoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import CompressedTensorsWNA16MoEMethod 
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import CompressedTensorsW4A4Nvfp4MoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4MoEMethod
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        if (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)):
+    
+            self._process_wna16(self.quant_method.strategy)
+            return True 
+            
+        if isinstance(self.quant_method, Fp8MoEMethod):
+            self._process_fp8(self.quant_method.block_quant)
+            return True
+            
+        if isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
+            self._process_fp8(False)
+            return True
+            
+        if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
+            self._process_bf6_fp16()
+            return True
+
+        if isinstance(self.quant_method, CompressedTensorsW4A4Nvfp4MoEMethod) or isinstance(self.quant_method, ModelOptNvFp4FusedMoE):
+            self._process_nvfp4()
+            return True
+            
+        if isinstance(self.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod) or isinstance(self.quant_method, Mxfp4MoEMethod):
+            self._process_mxfp4()
+            return True
+        
+    
     def process_weights_after_loading(self):
         if self.is_gpu_resident_layer:
             logger.info(f"Initialized lk_moe with {self.local_num_experts} experts for layer {self.layer_name} [" + 
@@ -1332,43 +1367,8 @@ class RoutedExperts(PluggableLayer):
 
         torch.cuda.synchronize()
         try:
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import CompressedTensorsWNA16MarlinMoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import CompressedTensorsWNA16MoEMethod 
-            from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import CompressedTensorsW4A4Nvfp4MoEMethod
-            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4MoEMethod
-            from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
-            from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
-            find_weight = False  
-            with torch.no_grad():
-                if (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)):
-    
-                    self._process_wna16(self.quant_method.strategy)
-                    find_weight = True 
-                    
-                if isinstance(self.quant_method, Fp8MoEMethod):
-                    self._process_fp8(self.quant_method.block_quant)
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
-                    self._process_fp8(False)
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
-                    self._process_bf6_fp16()
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW4A4Nvfp4MoEMethod) or isinstance(self.quant_method, ModelOptNvFp4FusedMoE):
-                    self._process_nvfp4()
-                    find_weight = True
-                    
-                if isinstance(self.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod) or isinstance(self.quant_method, Mxfp4MoEMethod):
-                    self._process_mxfp4()
-                    find_weight = True
-                    
-                
-                if not find_weight: 
+            with torch.no_grad(): 
+                if not self._do_process_weights_after_loading(): 
                     logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
                     return
                 
@@ -1408,8 +1408,8 @@ class RoutedExperts(PluggableLayer):
                    
      
     def _process_wna16(self, strategy: str): 
-        
-        is_transposed = self.quant_method.kernel_backend  != "Flashinfer"
+        from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import WNA16MoEBackend
+        is_transposed = False if (hasattr(self.quant_method, "wna16_backend") and self.quant_method.wna16_backend  == WNA16MoEBackend.FLASHINFER_TRTLLM) else True
          
         if(is_transposed):
             w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
