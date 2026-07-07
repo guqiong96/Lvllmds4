@@ -40,16 +40,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 logger = init_logger(__name__)
 
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.envs import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_in_profile_run
-
-if is_lk_moe_feature_enabled():
-    import  lk_moe  
-    logger.info("lk_moe module is available, lk::MOE implementation will be used")
-else:
-    logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
-
-
 
 def make_parallel_config(
     tp_size: int | None,

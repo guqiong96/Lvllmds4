@@ -54,7 +54,6 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
-from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
