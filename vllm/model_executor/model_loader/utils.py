@@ -104,7 +104,6 @@ def process_weights_after_loading(
     from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
     for _, module in model.named_modules():
         if isinstance(module, RoutedExperts) and not getattr(module, "process_lk_moe_already_called", False):
-            module._ensure_moe_quant_config_init()
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
