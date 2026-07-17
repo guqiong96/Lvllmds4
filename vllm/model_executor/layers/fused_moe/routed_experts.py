@@ -125,7 +125,7 @@ class RoutedExperts(PluggableLayer):
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
         if vllm_config.model_config is not None:
-            self.check_nan_in_output = (vllm_config.model_config.architecture in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM"])
+            self.check_nan_in_output = (vllm_config.model_config.architecture in ["MiniMaxM3SparseForConditionalGeneration", "MiniMaxM2ForCausalLM", "Step3p5ForCausalLM"])
         else:
             self.check_nan_in_output = False
         
@@ -150,6 +150,15 @@ class RoutedExperts(PluggableLayer):
             )
         self.max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.max_num_group_batch_size = self.get_max_num_group_batch_size()
+        
+        from vllm.model_executor.layers.fused_moe.config import MoEActivation
+        
+        moe_activation = self.moe_config.activation
+        self.activation_type = 0  # silu
+        if moe_activation in (MoEActivation.SWIGLUOAI, MoEActivation.SWIGLUOAI_UNINTERLEAVE):
+            self.activation_type = 1  # swigluoai
+        elif not self.has_gate_proj:
+            self.activation_type = 2  # relu2
         
         self.quant_method = self._get_quant_method(
             self.layer_name,
@@ -1402,11 +1411,19 @@ class RoutedExperts(PluggableLayer):
             return self.ep_size, self.ep_rank, torch.cuda.current_device()
         return self.tp_size, self.tp_rank, torch.cuda.current_device()
     
-    def _get_quant_params(self, w13_weight, w13_weight_scale, pack_ratio):
+    def _get_quant_params(self, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, pack_ratio):
         unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
         
-        groupN = w13_weight.shape[1] // w13_weight_scale.shape[1]
-        groupK = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
+        groupN_w13 = w13_weight.shape[1] // w13_weight_scale.shape[1]
+        groupK_w13 = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
+        
+        groupN_w2 = w2_weight.shape[1] // w2_weight_scale.shape[1]
+        groupK_w2 = (w2_weight.shape[2] * unpack_factor) // w2_weight_scale.shape[2]
+        
+         
+        groupN = max(groupN_w13, groupN_w2)
+        groupK = max(groupK_w13, groupK_w2)
+        
         return groupN, groupK
                    
      
@@ -1433,7 +1450,7 @@ class RoutedExperts(PluggableLayer):
  
         weights_per_container = packed_factor // num_bits  # 2 
         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, weights_per_container)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, w2_weight, w2_scale, weights_per_container)
         
         w13_weight_ptr = w13_weight.data_ptr()
         w2_weight_ptr = w2_weight.data_ptr()
@@ -1460,6 +1477,11 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_alpha is not None:
+            self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
         self.lk_moe = lk_moe.MOE_WNA16(
@@ -1499,7 +1521,7 @@ class RoutedExperts(PluggableLayer):
             w2_weight_scale = self.w2_weight_scale
         
         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 1)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 1)
 
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
@@ -1525,6 +1547,11 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_alpha is not None:
+            self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
         self.lk_moe = lk_moe.MOE_FP8(
@@ -1560,6 +1587,11 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_alpha is not None:
+            self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
         
         # no scale
         self.lk_moe = lk_moe.MOE_BF16(
@@ -1585,7 +1617,7 @@ class RoutedExperts(PluggableLayer):
         w2_weight_global_scale = self.w2_weight_global_scale if hasattr(self, "w2_weight_global_scale") else self.w2_weight_scale_2
          
          
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 2)
         
         if need_reciprocal_global_scale:
             w13_weight_global_scale = 1.0 / w13_weight_global_scale
@@ -1616,6 +1648,11 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_alpha is not None:
+            self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
          
         self.lk_moe = lk_moe.MOE_NVFP4(
             self.lk_moe_config,
@@ -1635,7 +1672,7 @@ class RoutedExperts(PluggableLayer):
         w13_weight_scale = self.w13_weight_scale
         w2_weight_scale = self.w2_weight_scale 
          
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 2)
 
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
@@ -1661,6 +1698,11 @@ class RoutedExperts(PluggableLayer):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_alpha is not None:
+            self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
         self.lk_moe = lk_moe.MOE_MXFP4(
