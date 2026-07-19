@@ -1484,15 +1484,27 @@ class RoutedExperts(PluggableLayer):
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_WNA16(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_WNA16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_WNA16_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+            
          
             
     
@@ -1554,15 +1566,26 @@ class RoutedExperts(PluggableLayer):
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_FP8(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_FP8(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_FP8_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
             
     def _process_bf6_fp16(self):
         w13_weight = self.w13_weight
@@ -1594,15 +1617,27 @@ class RoutedExperts(PluggableLayer):
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
         
         # no scale
-        self.lk_moe = lk_moe.MOE_BF16(
-            self.lk_moe_config,
-            w13_ptr,
-            w2_ptr,
-             0,
-             0,
-             0,
-             0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_BF16(
+                self.lk_moe_config,
+                w13_ptr,
+                w2_ptr,
+                0,
+                0,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_FP16(
+                self.lk_moe_config,
+                w13_ptr,
+                w2_ptr,
+                0,
+                0,
+                0,
+                0,
+            )
+        
         
         
     
@@ -1653,16 +1688,28 @@ class RoutedExperts(PluggableLayer):
             self.lk_moe_config.swiglu_alpha = self.swiglu_alpha 
         if self.swiglu_limit is not None:
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
+        
          
-        self.lk_moe = lk_moe.MOE_NVFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            w13_weight_global_scale_ptr,
-            w2_weight_global_scale_ptr,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_NVFP4(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                w13_weight_global_scale_ptr,
+                w2_weight_global_scale_ptr,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_NVFP4_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                w13_weight_global_scale_ptr,
+                w2_weight_global_scale_ptr,
+            )
         
  
     
@@ -1705,15 +1752,26 @@ class RoutedExperts(PluggableLayer):
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_MXFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_MXFP4(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_MXFP4_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
          
          
     def _get_max_num_seqs(self, vllm_config) -> int:

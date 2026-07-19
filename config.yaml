@@ -3,7 +3,7 @@ host: "0.0.0.0"
 port: 8070
 tensor-parallel-size: 2
 #pipeline-parallel-size: 2 
-max-model-len: 13000
+max-model-len: 32000
 gpu-memory-utilization: 0.95
 trust-remote-code: true
 tokenizer-mode: "auto"
