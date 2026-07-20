@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    get_kv_quant_mode,
 )
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
@@ -94,8 +95,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
+            alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
         )
 
     def forward(self): ...
@@ -296,8 +299,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     - Chunked prefill (aligns with the indexer's chunking)
     """
 
-    # Base threshold: query_len <= 1 is decode
-    reorder_batch_threshold: int = 1
+    reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
@@ -308,19 +310,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = mla_spec.compress_ratio
         self.block_size = mla_spec.block_size
 
-        # Handle MTP: classify single-token queries plus speculative tokens as
-        # decodes, matching the runner-side batch reorder threshold.
+        # Handle MTP: adjust decode_threshold like the indexer does
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # The spec-as-decode helper sets reorder_batch_threshold to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens,
-        # which MUST match the flashmla_sparse / indexer threshold so that all
-        # backends agree on the decode/prefill split.
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
-        assert self.reorder_batch_threshold is not None
-        self.decode_threshold = self.reorder_batch_threshold
+        # Decode can have query_len up to
+        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
+        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
+        # the prefill path and the decode/prefill split stays at that width.
+        # Like the indexer, sparse_swa opts out of the runner's shared
+        # reorder-threshold vote (which takes the min across builders) so that it
+        # cannot drag flashmla_sparse's much larger MHA-routing threshold down;
+        # its own split uses self.decode_threshold.
+        spec_mult = (
+            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
+        )
+        self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -404,7 +411,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         For prefill, we use chunked prefill to align with the indexer's chunking.
         """
-        num_reqs = common_attn_metadata.num_reqs
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -420,10 +426,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        token_to_req_indices = common_attn_metadata.token_to_req_indices(
+            self.token_to_req_indices
+        )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)

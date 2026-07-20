@@ -68,13 +68,18 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
-        "Qwen2MoeForCausalLM",
         "GraniteMoeForCausalLM",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "LongcatFlashNgramForCausalLM",
+        "Qwen2MoeForCausalLM",
     }
 )
 
 _BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
     {
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
     }
@@ -112,8 +117,8 @@ def _should_auto_enable_breakable_cudagraph(
     model_config: ModelConfig,
 ) -> bool:
     # Auto-enable breakable cudagraph only for architectures that lack
-    # @support_torch_compile and are known-good under it (MiniMax M3 retains its
-    # upstream unconditional auto-enable). DeepSeek-V4 is deliberately excluded:
+    # @support_torch_compile and are known-good under it (MiniMax M3 and Inkling
+    # retain their upstream auto-enable). DeepSeek-V4 is deliberately excluded:
     # breakable mode disables the torch.compile pipeline (equivalent to
     # -cc.mode=none) and runs attention eagerly every decode step, which on SM12x
     # is 1.5-3.8x SLOWER for MTP decode and degrades with output length (measured
@@ -215,6 +220,15 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
+    """Enable fused QK-norm + RoPE + KV cache update on ROCm with AITER."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_enabled():
+        return False
+    return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -227,6 +241,8 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_act_padding": False,
             "fuse_mla_dual_rms_norm": False,
             "fuse_rope_kvcache": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
@@ -248,6 +264,8 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": False,
+            "fuse_qk_norm_rope_kvcache": False,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
@@ -269,6 +287,8 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -290,6 +310,8 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
+            "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -527,6 +549,17 @@ class VllmConfig:
         return pp_size
 
     @property
+    def max_in_flight_tokens(self) -> int:
+        # Upper bound on tokens that are scheduled but not yet settled (freed):
+        # every concurrent batch may hold up to a full `max_num_batched_tokens`.
+        # Recycling-aware KV cache specs (sliding-window, chunked-local) reserve
+        # for this because out-of-window blocks are freed on the processed-token
+        # basis, so in-flight steps transiently keep their blocks.
+        return (
+            self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
+        )
+
+    @property
     def num_speculative_tokens(self) -> int:
         if (
             self.speculative_config is not None
@@ -553,6 +586,11 @@ class VllmConfig:
         # by default, since DeepSeek-V4 is not a default-V2 architecture). Opt
         # into the V2 DSpark speculator explicitly with VLLM_USE_V2_MODEL_RUNNER=1.
 
+        # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
+        # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
+        if self._dflash_needs_multi_kv_group():
+            return True
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
@@ -575,6 +613,18 @@ class VllmConfig:
             return False
 
         return True
+
+    def _dflash_needs_multi_kv_group(self) -> bool:
+        """Whether a DFlash draft mixes sliding-window and full attention."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        layer_types = getattr(draft_config.hf_config, "layer_types", None) or []
+        num_sliding = sum(lt == "sliding_attention" for lt in layer_types)
+        return 0 < num_sliding < len(layer_types)
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config
@@ -796,16 +846,37 @@ class VllmConfig:
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            or self.use_v2_model_runner
         ):
             return
 
         logger.warning_once(
             "Dynamic speculative decoding changes the target verification "
             "length at runtime. Overriding cudagraph_mode from %s to "
-            "PIECEWISE for reliability.",
+            "PIECEWISE for reliability. Use VLLM_USE_V2_MODEL_RUNNER=1 "
+            "if you want to use full CUDA graphs.",
             self.compilation_config.cudagraph_mode.name,
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+    def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is None
+            or not speculative_config.uses_dynamic_speculative_decoding()
+            or self.parallel_config.data_parallel_size <= 1
+        ):
+            return
+
+        logger.warning_once(
+            "Dynamic speculative decoding is not supported with data "
+            "parallelism because data-parallel ranks can select different "
+            "speculative-token counts, causing DP divergence and deadlocks. "
+            "Disabling num_speculative_tokens_per_batch_size and falling back "
+            "to static num_speculative_tokens=%d.",
+            speculative_config.num_speculative_tokens,
+        )
+        speculative_config.num_speculative_tokens_per_batch_size = None
 
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
@@ -1214,6 +1285,7 @@ class VllmConfig:
                 "optimization level defaults."
             )
 
+        self._maybe_disable_dynamic_sd_for_data_parallel()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (
@@ -1863,8 +1935,13 @@ class VllmConfig:
             tp_size = self.parallel_config.tensor_parallel_size
             from vllm._aiter_ops import rocm_aiter_ops
 
-            if rocm_aiter_ops.is_enabled():
-                max_size = rocm_aiter_ops.get_aiter_allreduce_max_size()
+            max_size: int | None = None
+            if rocm_aiter_ops.is_custom_all_reduce_enabled():
+                from vllm.distributed.device_communicators.aiter_custom_all_reduce import (  # noqa: E501
+                    AiterCustomAllreduce,
+                )
+
+                max_size = AiterCustomAllreduce.effective_max_size()
             else:
                 max_size = compilation_config.pass_config.flashinfer_max_size(tp_size)
             if max_size is not None and self.model_config is not None:
@@ -1926,6 +2003,21 @@ class VllmConfig:
                         compile_range_end,
                     )
 
+        if compilation_config.pass_config.fuse_qk_norm_rope_kvcache:
+            max_token_num = (
+                compilation_config.pass_config.rope_kvcache_fusion_max_token_num
+            )
+            if max_token_num is not None:
+                if compile_range_end is not None and max_token_num < compile_range_end:
+                    computed_compile_ranges_endpoints.append(max_token_num)
+                else:
+                    logger.debug(
+                        "Max num batched tokens below qk_norm+rope+kvcache "
+                        "fusion threshold, fusion enabled for "
+                        "num_tokens <= %d.",
+                        compile_range_end,
+                    )
+
         if compilation_config.compile_ranges_endpoints is not None:
             for x in compilation_config.compile_ranges_endpoints:
                 assert isinstance(x, int)
@@ -1949,12 +2041,21 @@ class VllmConfig:
         if architecture is None:
             return
 
+        from vllm.model_executor.models import ModelRegistry
         from vllm.model_executor.models.config import (
             MODELS_CONFIG_MAP,
             HybridAttentionMambaModelConfig,
         )
 
         cls = MODELS_CONFIG_MAP.get(architecture, None)
+        if cls is None:
+            # `architecture` may be an HF base-model name (e.g. "Mamba2Model"
+            # when `architectures` is omitted); normalize to the resolved arch
+            # so per-arch config hooks are not skipped.
+            architecture = ModelRegistry._normalize_arch(
+                architecture, self.model_config
+            )
+            cls = MODELS_CONFIG_MAP.get(architecture, None)
         if cls is not None:
             cls.verify_and_update_config(self)
 
@@ -2076,9 +2177,6 @@ class VllmConfig:
                 "dspark",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
-
-            if speculative_config.uses_dynamic_speculative_decoding():
-                unsupported.append("dynamic speculative decoding")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
             # DFlash and DSpark use parallel drafting natively in V2 via their
