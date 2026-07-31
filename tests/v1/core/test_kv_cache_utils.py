@@ -2397,6 +2397,19 @@ def test_check_enough_kv_cache_memory_respects_num_gpu_blocks_override():
         get_kv_cache_configs(vllm_config, [kv_cache_specs], [large_available_memory])
 
 
+def test_check_enough_kv_cache_memory_can_be_overridden(monkeypatch, caplog):
+    monkeypatch.setenv("VLLM_ALLOW_INSUFFICIENT_KV_CACHE", "1")
+
+    kv_cache_utils._check_enough_kv_cache_memory(
+        available_memory=1,
+        get_needed_memory=lambda: 2,
+        max_model_len=1024,
+        estimate_max_model_len=lambda _: 512,
+    )
+
+    assert "KV cache check was overridden" in caplog.text
+
+
 def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     """DFlash drafters can have a smaller head size than the target model.
 
