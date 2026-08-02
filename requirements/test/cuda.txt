@@ -111,7 +111,7 @@ cffi==2.0.0
     # via
     #   cryptography
     #   soundfile
-chardet==5.2.0
+chardet==7.4.3
     # via mbstrdecoder
 charset-normalizer==3.4.0
     # via requests
