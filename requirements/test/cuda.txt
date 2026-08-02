@@ -20,7 +20,7 @@ aiohttp-cors==0.8.1
     # via ray
 aiosignal==1.4.0
     # via aiohttp
-albumentations==1.4.6
+albumentations==2.0.8
     # via -r requirements/test/cuda.in
 alembic==1.16.4
     # via optuna
