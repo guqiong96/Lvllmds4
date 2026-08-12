@@ -22,14 +22,17 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
+    mhc_fused_post_pre_tilelang_reuse_residual,
+    mhc_post_hc_head_tilelang,
+    mhc_post_mean_hc_head_tilelang,
+    mhc_post_mean_tilelang,
     mhc_post_tilelang,
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import (
@@ -67,7 +70,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -584,6 +594,7 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        use_sequence_parallel: bool = False,
     ):
         super().__init__()
 
@@ -591,6 +602,7 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
+        self.use_sequence_parallel = use_sequence_parallel
         self._layer_idx = extract_layer_index(prefix)
         # An extra layer (layer_idx >= num_hidden_layers) is a DSpark runtime
         # draft layer ONLY when the DSpark speculator is active. The MTP block is
@@ -684,6 +696,7 @@ class DeepseekV4MoE(nn.Module):
                     self._dspark_fused_shared_experts_quant
                     and self._is_dspark_runtime_layer
                 ),
+                is_sequence_parallel=use_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -760,7 +773,7 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -778,6 +791,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            is_sequence_parallel=self.use_sequence_parallel,
         )
         self._sync_fused_moe_metadata()
 
@@ -863,6 +877,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
+            # In this case, the gate/router runs inside the MoERunner class
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -932,20 +947,48 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     import vllm.envs as envs
 
     if envs.VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE:
-        from vllm.utils.flashinfer import has_flashinfer_trtllm_sparse_mla_dsv4
+        from vllm.utils.flashinfer import (
+            flashinfer_sm120_sparse_mla_unavailable_reason,
+        )
 
-        if (
-            device_capability is not None
-            and device_capability.major == 12
-            and has_flashinfer_trtllm_sparse_mla_dsv4()
-        ):
-            from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
-                DeepseekV4FlashInferSM120DecodeAttention,
+        if device_capability is not None and device_capability.major == 12:
+            reason = flashinfer_sm120_sparse_mla_unavailable_reason()
+            if reason is None:
+                from vllm.models.deepseek_v4.nvidia.flashinfer_sm120_decode import (
+                    DeepseekV4FlashInferSM120DecodeAttention,
+                )
+
+                return DeepseekV4FlashInferSM120DecodeAttention
+            # The packed path is default-on for SM12x; a silent FlashMLA
+            # fallback hides broken installs until recall degrades. Fail
+            # loudly with the reason; opt into the fallback explicitly with
+            # VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=0.
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 packed sparse-MLA decode is enabled "
+                f"(VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE=1) but: {reason}"
             )
 
-            return DeepseekV4FlashInferSM120DecodeAttention
-
     return DeepseekV4FlashMLAAttention
+
+
+def _needs_mtp_target_hidden_buffer(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.method != "mtp":
+        return False
+    draft_config = spec_config.draft_model_config
+    hf_config = getattr(draft_config, "hf_config", None)
+    return hasattr(hf_config, "compress_ratios") and hasattr(hf_config, "hc_mult")
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    return (
+        parallel_config.pipeline_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
+    )
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -955,11 +998,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = _select_dsv4_attn_cls(vllm_config)(
@@ -967,8 +1012,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            eager_scratch_pool=eager_scratch_pool,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        if self.use_sequence_parallel:
+            self.attn.wo_b.reduce_results = False
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{prefix}.ffn",
+            use_sequence_parallel=self.use_sequence_parallel,
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1067,7 +1119,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=attn_norm_eps,
                 )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang_reuse_residual(
                 x,
                 residual,
                 post_mix,
@@ -1086,12 +1138,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
 
-        # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+
         x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang_reuse_residual(
             x,
             residual,
             post_mix,
@@ -1126,6 +1182,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -1143,6 +1200,62 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        n_local_heads = (
+            config.num_attention_heads // get_tensor_model_parallel_world_size()
+        )
+        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
+            n_local_heads
+        )
+        # The eager scratch pool is OFF by default: it corrupts output under
+        # concurrent mixed prefill+decode.
+        #
+        # Reported with a clean bisect on vllm-project/vllm#41834 (tobymao,
+        # TP=4 SM12x, 1M context) -- leaked BOS tokens mid-sentence, multilingual
+        # token salad, terminal single-token repetition; pool active 7/7 rounds
+        # corrupt, pool disabled 0/2, pre-pool build 0/2, and it reproduces with
+        # speculative decoding both on and off.
+        #
+        # There are TWO races, and only one is fixed. The cross-TEMPLATE aliasing
+        # (all three families carved from offset 0) is gone -- see the sum()
+        # sizing in eager_scratch.py. But each template is still shared across all
+        # 43 layers: compressor_scratch()/indexer_q_outputs()/global_topk_outputs()
+        # hand every layer a view of the SAME buffer, keyed only by num_tokens. The
+        # attention eager break runs the indexer and compressor on parallel aux
+        # streams, so layer N's consumer can still be reading while layer N+1
+        # writes. The reporter tested the sum() fix specifically and still saw 1
+        # corrupt round in 2; with the pool disabled, 2/2 clean, which is what they
+        # now run in production.
+        #
+        # Making it safe needs per-layer buffers (43x the footprint) or explicit
+        # stream-ordering events. Until then the pool is opt-in.
+        #
+        # What OFF costs us: on the default SM12x path allocate_q is already False
+        # (attention writes Q in place), so the 256 MiB Q buffer this pool exists
+        # to manage is not allocated either way. Only the ~36 MiB of aux views stop
+        # being pooled -- allocator churn, not capacity.
+        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
+        if (
+            not vllm_config.parallel_config.use_ubatching
+            and envs.VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL
+        ):
+            # TODO: support dbo if needed
+            # this requires the buffer to have ubatch dim
+            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                padded_heads,
+                config.head_dim,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                current_platform.device_type,
+                # Same predicate as DeepseekV4Attention._qnorm_rope_can_write_inplace,
+                # evaluated on the same two model-wide quantities: when Q needs no
+                # padding, attention writes it in place and the pool's Q buffer is
+                # never read. True on the default SM12x path (the FlashInfer-SM120
+                # decode class pads to {16,32,64,128}, so 64/TP maps to itself);
+                # false on the FlashMLA class, which pads everything to 64.
+                allocate_q=padded_heads != n_local_heads,
+            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1168,6 +1281,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                eager_scratch_pool=self.eager_scratch_pool,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1198,11 +1312,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
         # Pre-hc_head residual stream buffer for the MTP draft. Stable
         # address (outside the cudagraph pool) so the copy_ in forward()
-        # refreshes it correctly across captured shapes.
-        # refreshes it correctly across captured shapes. Only allocated on
-        # the last PP rank — that's where MTP target hidden states are
-        # produced.
-        if get_pp_group().is_last_rank:
+        # refreshes it correctly across captured shapes. Allocated only when an
+        # MTP drafter can consume it: both readers of
+        # get_mtp_target_hidden_states() are gated on `method == "mtp"`, and the
+        # DFlash/DSpark speculators take aux hidden states instead. Upstream
+        # gates this on use_eagle() or uses_draft_model(), which also covers
+        # dspark/dflash/eagle and so reserves the buffer for drafters that never
+        # read it.
+        if get_pp_group().is_last_rank and _needs_mtp_target_hidden_buffer(vllm_config):
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1254,13 +1371,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, hidden_states
+                )
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)
+
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        final_aux_mean_pending = False
+        is_last_rank = get_pp_group().is_last_rank
+        ran_decoder_layer = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            ran_decoder_layer = True
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1270,36 +1401,113 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
             if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
-                aux_hidden_states.append(aux_recon.mean(dim=1))
-                final_aux_recon = aux_recon
-        if layer is not None:
+                if (
+                    idx + 1 == self.end_layer
+                    and is_last_rank
+                    and self._mtp_hidden_buffer is None
+                    and not self.use_sequence_parallel
+                ):
+                    # Deferring the final mhc_post is incompatible with SP: the
+                    # tail gathers hidden_states while residual/post_mix/res_mix
+                    # stay sharded, so a deferred mhc_post_* would mix token
+                    # counts. Under SP fall through and materialize eagerly.
+                    final_aux_mean_pending = True
+                    final_aux_recon = None
+                elif idx + 1 == self.end_layer:
+                    # The final local layer may need the full post tensor for
+                    # PP handoff or the MTP target hidden buffer.
+                    aux_recon = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = aux_recon.mean(dim=1)
+                    if self.use_sequence_parallel:
+                        aux_hidden_state = sp_all_gather(aux_hidden_state)[
+                            :full_num_tokens
+                        ]
+                    aux_hidden_states.append(aux_hidden_state)
+                    final_aux_recon = aux_recon
+                else:
+                    aux_hidden_state = mhc_post_mean_tilelang(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                    )
+                    if self.use_sequence_parallel:
+                        aux_hidden_state = sp_all_gather(aux_hidden_state)[
+                            :full_num_tokens
+                        ]
+                    aux_hidden_states.append(aux_hidden_state)
+                    final_aux_recon = None
+
+        final_post_materialized = not ran_decoder_layer
+        if ran_decoder_layer:
             # Reuse if the last layer was captured as an aux hidden state
-            if self.end_layer in self.aux_hidden_state_layers:
+            if final_aux_mean_pending:
+                pass
+            elif self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
-            else:
+                final_post_materialized = True
+            elif (
+                not is_last_rank
+                or self._mtp_hidden_buffer is not None
+                or self.use_sequence_parallel
+            ):
                 hidden_states = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
+                final_post_materialized = True
 
-        if not get_pp_group().is_last_rank:
+        if not is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if self.use_sequence_parallel:
+            # hidden_states must already be mhc_post-materialized here: the
+            # gather makes it full-length while residual/post_mix/res_mix stay
+            # sharded, so any later mhc_post_* call would mix token counts.
+            assert final_post_materialized
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
-        hidden_states = hc_head_fused_kernel_tilelang(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        if self._mtp_hidden_buffer is not None:
+            assert final_post_materialized
+            # Stash pre-hc_head residual for the MTP draft (captured copy_).
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+
+        if final_aux_mean_pending:
+            hidden_states, aux_mean = mhc_post_mean_hc_head_tilelang(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            aux_hidden_states.append(aux_mean)
+        elif ran_decoder_layer and not final_post_materialized:
+            hidden_states = mhc_post_hc_head_tilelang(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+        else:
+            hidden_states = hc_head_fused_kernel_tilelang(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -1334,12 +1542,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks land on the zero pad). SP / unquantized ones need no padding.
         pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
-            and not self.parallel_config.use_sequence_parallel_moe
+            and not self.use_sequence_parallel
         )
 
         for name, loaded_weight in weights:
             if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
+                loaded_weight = self._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1414,15 +1624,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         return loaded_params
 
+    @staticmethod
     def _pad_shared_expert_weight(
-        self, name: str, loaded_weight: torch.Tensor
+        quant_config: QuantizationConfig | None,
+        name: str,
+        loaded_weight: torch.Tensor,
     ) -> torch.Tensor:
         """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
         axis so the standard TP loaders split it into even, block-aligned shards
         (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
         down (w2 -> down_proj) [H, I] pads dim 1.
         """
-        block_size = getattr(self.quant_config, "weight_block_size", None)
+        block_size = getattr(quant_config, "weight_block_size", None)
         assert block_size is not None
         # Round the intermediate axis up to a whole number of TP shards. The axis
         # is in elements for weights (step = block) and in blocks for scales.

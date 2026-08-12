@@ -13,8 +13,6 @@ from vllm.models.deepseek_v4.nvidia.dspark import (
 )
 from vllm.models.deepseek_v4.nvidia.dspark_triton import (
     dspark_context_kv_store,
-    dspark_inv_rope_bf16_layout,
-    dspark_markov_greedy_argmax,
     dspark_qkv_postprocess,
     dspark_triton_attention,
 )
@@ -160,7 +158,15 @@ def test_dspark_triton_attention_matches_reference(batch_size):
         scale,
     )
 
-    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+    # atol must exceed one bf16 ULP at the output magnitude, or the assertion
+    # demands that two different reduction orders round identically. Outputs
+    # here peak at |2.94|, where the bf16 spacing is 2**-6 = 0.015625 -- three
+    # times the old atol=5e-3, so the test could only ever pass by luck. It did
+    # not: exactly one element out of 983,040 differed, by exactly 1.00 ULP.
+    # Measured across the whole tensor, ZERO elements exceed 1 ULP, i.e. the
+    # Triton kernel matches the reference as closely as bf16 permits. 2e-2
+    # leaves 1.28 ULP of headroom, so a genuine 2-ULP error still fails.
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=5e-3)
 
 
 def test_dspark_markov_sampling_chains_sampled_tokens():
@@ -483,7 +489,13 @@ def test_dspark_shares_target_embedding_and_lm_head(monkeypatch):
     assert proposer.model.head is not old_head
 
 
-def test_load_dspark_model_shares_direct_draft_embedding_and_head(monkeypatch):
+@pytest.mark.parametrize(
+    ("draft_architecture", "uses_target_quant_config"),
+    [("DSparkDraftModel", True), ("Qwen3DSparkModel", False)],
+)
+def test_load_dspark_model_shares_direct_draft_embedding_and_head(
+    monkeypatch, draft_architecture, uses_target_quant_config
+):
     class DummyPPGroup:
         world_size = 1
 
@@ -511,22 +523,46 @@ def test_load_dspark_model_shares_direct_draft_embedding_and_head(monkeypatch):
     draft = DraftModel()
     old_embed = draft.embed_tokens
     old_head = draft.head
+    target_quant_config = object()
+    draft_quant_config = object()
+    loaded_vllm_config = None
     spec_config = SimpleNamespace(
-        draft_model_config=object(),
+        draft_model_config=SimpleNamespace(
+            architectures=[draft_architecture],
+            hf_config=SimpleNamespace(num_hidden_layers=0),
+        ),
         attention_backend="FLASH_ATTN",
+        kv_cache_dtype=None,
     )
     vllm_config = SimpleNamespace(
         speculative_config=spec_config,
         attention_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(),
+        quant_config=target_quant_config,
+        load_config=SimpleNamespace(),
     )
 
+    def fake_get_model(**kwargs):
+        nonlocal loaded_vllm_config
+        loaded_vllm_config = kwargs["vllm_config"]
+        return draft
+
     monkeypatch.setattr(dspark_utils, "get_pp_group", lambda: DummyPPGroup())
-    monkeypatch.setattr(dspark_utils, "get_model", lambda **kwargs: draft)
+    monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
     monkeypatch.setattr(dspark_utils, "replace", fake_replace)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        lambda _: draft_quant_config,
+    )
 
     loaded = dspark_utils.load_dspark_model(target, vllm_config)
 
     assert loaded is draft
+    assert loaded_vllm_config is not None
+    expected_quant_config = (
+        target_quant_config if uses_target_quant_config else draft_quant_config
+    )
+    assert loaded_vllm_config.quant_config is expected_quant_config
     assert draft.embed_tokens is target.model.embed_tokens
     assert draft.head is target.lm_head
     assert draft.embed_tokens is not old_embed
@@ -554,58 +590,6 @@ def test_dspark_triton_qkv_postprocess_matches_reference():
 
     assert torch.allclose(q_out.float(), q_ref.float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(kv_out.float(), kv_ref.float(), atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dspark_triton_inv_rope_bf16_layout_matches_reference():
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    torch.manual_seed(0)
-
-    tokens = 5
-    n_groups = 2
-    heads_per_group = 3
-    head_dim = 512
-    rope_dim = 64
-    nope_dim = head_dim - rope_dim
-    o = torch.randn(
-        tokens,
-        n_groups * heads_per_group,
-        head_dim,
-        dtype=dtype,
-        device=device,
-    ).contiguous()
-    positions = torch.tensor([0, 3, 7, 11, 15], dtype=torch.int64, device=device)
-    angles = torch.randn(32, rope_dim // 2, dtype=torch.float32, device=device)
-    cos_sin_cache = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
-
-    out = dspark_inv_rope_bf16_layout(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups=n_groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-    )
-
-    cs = cos_sin_cache.index_select(0, positions).to(torch.float32)
-    cos = cs[:, : rope_dim // 2].unsqueeze(1)
-    sin = cs[:, rope_dim // 2 :].unsqueeze(1)
-    ref = o.clone()
-    rope = ref[..., nope_dim:].float()
-    shape = rope.shape
-    rope = rope.reshape(*shape[:-1], rope_dim // 2, 2)
-    even = rope[..., 0]
-    odd = rope[..., 1]
-    inv_even = even * cos + odd * sin
-    inv_odd = odd * cos - even * sin
-    ref[..., nope_dim:] = (
-        torch.stack((inv_even, inv_odd), dim=-1).reshape(shape).to(dtype)
-    )
-    ref = ref.view(tokens, n_groups, heads_per_group, head_dim)
-    ref = ref.reshape(tokens, n_groups, heads_per_group * head_dim)
-    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -649,35 +633,71 @@ def test_dspark_triton_context_kv_store_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dspark_triton_markov_greedy_argmax_matches_reference():
-    device = torch.device("cuda")
-    torch.manual_seed(0)
-    batch_size = 2
-    vocab_size = 137
-    rank = 16
-    dtype = torch.bfloat16
+def test_dspark_fused_markov_sampler_bounds_fully_masked_row():
+    """A fully-masked row must not emit an out-of-vocab token id.
 
-    base_logits = torch.randn(
-        batch_size, vocab_size, dtype=torch.float32, device=device
+    The fused sampler's per-block kernel stores `vocab_size` as the filler when a
+    block has no active lane. On a row where every candidate is -inf -- which
+    structured-output constraints can produce -- NO block has an active lane, so
+    every block stores the filler, and the reduce kernel's tie-break (all blocks
+    compare equal at -inf) returns it verbatim as the sampled token.
+
+    Nothing downstream bounds that id: the runner clamped input_ids with min=0
+    only, and the DSv4 hash-MoE router indexes tid2eid[token_id * 6 + lane] on a
+    [vocab_size, 6] table, reading off the end -- an illegal memory access on
+    every TP rank, reported from production in vllm-project/vllm#41834.
+
+    Only the fused path is affected: the eager fallback uses argmax, and the
+    fused path is skipped for all-greedy or seeded batches, so the whole class is
+    invisible to any greedy gate. Both sampler modes are checked here, and the
+    eager reference is checked too so the expectation is anchored to real
+    behaviour rather than to my assumption about it.
+    """
+    batch, block, vocab = 2, 3, 4096
+
+    # Deliberately a bias that does NOT gather on prev_token_ids. The real bias
+    # does (w1[prev_token_ids]), and with the bug the out-of-vocab id from step 0
+    # is fed straight back into that gather at step 1, tripping a DEVICE-SIDE
+    # assert. That is a faithful demonstration of the consequence, but it aborts
+    # the CUDA context and takes every later test in the file down with it, so
+    # the failure would be unreadable and the suite unusable. Isolating the
+    # sampler keeps the explicit range assertion below as the failure mode.
+    def apply_markov_bias(logits, prev_token_ids, step_idx):
+        del prev_token_ids, step_idx
+        return logits
+
+    # Row 0 fully masked; row 1 ordinary, to prove the fix is row-local.
+    base_logits = torch.randn(batch, block, vocab, device=DEVICE_TYPE)
+    base_logits[0] = -float("inf")
+    first_prev = torch.tensor([1, 2], device=DEVICE_TYPE)
+
+    for all_greedy in (True, False):
+        tokens, _ = sample_dspark_markov_block_fused(
+            base_logits.clone(),
+            first_prev,
+            apply_markov_bias,
+            _sampling_metadata(all_greedy=all_greedy, batch_size=batch),
+        )
+        assert tokens.min() >= 0, f"negative token id (all_greedy={all_greedy})"
+        assert tokens.max() < vocab, (
+            f"out-of-vocab token id {int(tokens.max())} >= vocab_size {vocab} "
+            f"(all_greedy={all_greedy}) -- this is the #41834 illegal access"
+        )
+
+    # The eager reference is the contract the fused path must match, including
+    # on a degenerate row: torch.argmax over all--inf returns index 0.
+    eager, _ = sample_dspark_markov_block(
+        base_logits.clone(),
+        first_prev,
+        apply_markov_bias,
+        _sampling_metadata(all_greedy=True, batch_size=batch),
+        return_probs=False,
     )
-    w1 = torch.randn(vocab_size, rank, dtype=dtype, device=device)
-    w2 = torch.randn(vocab_size, rank, dtype=dtype, device=device)
-    prev_token_ids = torch.tensor([3, 41], dtype=torch.int64, device=device)
-    num_blocks = (vocab_size + 31) // 32
-    block_vals = torch.empty(batch_size, num_blocks, dtype=torch.float32, device=device)
-    block_ids = torch.empty(batch_size, num_blocks, dtype=torch.int64, device=device)
-    out = torch.empty(batch_size, dtype=torch.int64, device=device)
-
-    dspark_markov_greedy_argmax(
-        base_logits,
-        prev_token_ids,
-        w1,
-        w2,
-        block_vals,
-        block_ids,
-        out,
-        block_v=32,
+    assert eager.max() < vocab
+    fused, _ = sample_dspark_markov_block_fused(
+        base_logits.clone(),
+        first_prev,
+        apply_markov_bias,
+        _sampling_metadata(all_greedy=True, batch_size=batch),
     )
-
-    reference = (base_logits + w1[prev_token_ids].float() @ w2.float().T).argmax(dim=-1)
-    assert out.tolist() == reference.tolist()
+    torch.testing.assert_close(fused[0], eager[0])

@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -17,12 +19,14 @@ from vllm.model_executor.layers.quantization.utils.int8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     quant_dequant_mxfp4,
+    xpu_mxfp4_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     quant_dequant_mxfp6,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
+    xpu_mxfp8_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     ref_nvfp4_quant_dequant,
@@ -32,10 +36,15 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import (
+    nvfp4_block_scale_interleave as block_scale_interleave,
+)
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -45,6 +54,7 @@ def _count_expert_num_tokens(
     num_experts,
     topk_numel,
     expert_map,
+    num_global_experts,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -58,9 +68,14 @@ def _count_expert_num_tokens(
         mask = offsets < (topk_numel - x * BLOCK_SIZE)
         expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
         if HAS_EXPERT_MAP:
-            expert_map_ptrs = expert_map + expert_ids
-            expert_map_mask = expert_ids >= 0
-            expert_ids = tl.load(expert_map_ptrs, mask=expert_map_mask, other=-1)
+            # topk_ids can carry arbitrary positive garbage on the padded rows
+            # of a CUDA-graph batch (torch.empty allocation, routers do not
+            # overwrite every slot), so bound by the length of the map being
+            # indexed -- the GLOBAL expert count. The rank-local count is NOT
+            # a safe bound for expert_map under EP.
+            expert_map_mask = (expert_ids >= 0) & (expert_ids < num_global_experts)
+            safe_ids = tl.where(expert_map_mask, expert_ids, 0)
+            expert_ids = tl.load(expert_map + safe_ids, mask=expert_map_mask, other=-1)
 
         has_curr_expert = tl.where(expert_ids == curr_expert, 1, 0)
         acc = acc + has_curr_expert
@@ -103,6 +118,7 @@ def count_expert_num_tokens(
         num_local_experts,
         topk_ids.numel(),
         expert_map,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
@@ -195,6 +211,8 @@ def _mxfp4_quantize(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, None]:
+    if current_platform.is_xpu():
+        return xpu_mxfp4_quantize(A)
     assert block_shape is None
     # TODO: native mxfp4 is currently not integrated in vllm,
     # so simulating even on devices supporting this data type natively.
@@ -223,6 +241,8 @@ def _mxfp8_e4m3_quantize(
     is_sf_swizzled_layout: bool = False,
     mx_alignment: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_platform.is_xpu():
+        return xpu_mxfp8_quantize(A)
     assert A_scale is None
     assert not per_act_token_quant
     assert block_shape is None or block_shape == [1, 32]
@@ -309,7 +329,7 @@ def moe_kernel_quantize_input(
             A = ref_nvfp4_quant_dequant(A, A_scale, block_size=16)
             return A, None
     elif quant_dtype == "mxfp4":
-        if not quantization_emulation:
+        if not current_platform.is_xpu() and not quantization_emulation:
             raise NotImplementedError(
                 "moe_kernel_quantize_input should not be used for native"
                 " quant_dtype='mxfp4' MOE. Please open an issue."
@@ -318,7 +338,7 @@ def moe_kernel_quantize_input(
     elif quant_dtype == "mxfp8":
         # TODO: `quant_dtype == "mxfp8"` is ambiguous,
         # should be fp8_e4m3. OCP MX also defines `fp8_e5m2`.
-        if quantization_emulation:
+        if not current_platform.is_xpu() and quantization_emulation:
             raise NotImplementedError(
                 "moe_kernel_quantize_input does not support quant_dtype='mxfp8' MOE "
                 "quantization emulation. Please open an issue."
@@ -351,6 +371,39 @@ def moe_kernel_quantize_input(
         return _mxfp6_e2m3_quantize(A, A_scale, per_act_token_quant, block_shape)
     else:
         return A, A_scale
+
+
+# Quant dtypes whose activation scales use the swizzled 128x4 layout when the
+# kernel declares is_scale_swizzled=True. Must cover every quant_dtype branch in
+# moe_kernel_quantize_input that honors is_scale_swizzled.
+_SWIZZLED_SCALE_DTYPES = ("nvfp4", "mxfp8")
+
+
+def restore_dispatched_scale_layout(
+    a1q_scale: torch.Tensor | None,
+    quant_dtype: None | torch.dtype | str,
+    is_scale_swizzled: bool,
+) -> torch.Tensor | None:
+    """Swizzle activation scales after an a2a dispatch, if the kernel
+    expects it.
+
+    Dispatch paths quantize with is_scale_swizzled=False, since the swizzled
+    layout is padded and would not line up row-for-row with the hidden states
+    in the a2a. For kernels that expect swizzled scales, convert the
+    dispatched row-major scales to the swizzled 128x4 layout here; otherwise
+    return the scales unchanged.
+    """
+    if (
+        a1q_scale is None
+        or not is_scale_swizzled
+        or quant_dtype not in _SWIZZLED_SCALE_DTYPES
+    ):
+        return a1q_scale
+    if a1q_scale.element_size() == 1:
+        a1q_scale = a1q_scale.view(torch.uint8)
+    # despite its name, this is flashinfer's generic block_scale_interleave
+    # and handles mxfp8 scale vectors as well
+    return block_scale_interleave(a1q_scale)
 
 
 def normalize_scales_shape(scales: torch.Tensor | None) -> torch.Tensor | None:
@@ -579,3 +632,80 @@ def enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
         and BLOCK_SIZE_M < 64
         and BLOCK_SIZE_N >= 64
     )
+
+
+def moe_use_td_hw_supported() -> bool:
+    """Whether the current device can run the TD (gather) path of
+    ``fused_moe_kernel`` (ignores the ``VLLM_TRITON_USE_TD`` override).
+
+    The A-load uses ``tensor_descriptor.gather``, which lowers to the PTX
+    ``tile::gather4`` instruction. That instruction is part of the
+    ``tcgen05``/Tensor Memory (TMEM) family introduced with Blackwell and has
+    no Hopper (sm90) equivalent -- ptxas rejects it there ("Feature
+    '.tile::gather4 ...' requires .target sm_100 or higher"). Unlike
+    ``scatter4``, ``gather4`` is supported across the whole sm100+ range
+    including consumer Blackwell (sm120/sm121): see triton-lang/triton#8498,
+    which enables ``gather4`` on sm120/sm121 while leaving ``scatter4``
+    unsupported there. So this gates on a blanket ``has_device_capability(100)``
+    rather than the sm100 *family* check used for the scatter store path.
+    """
+    if current_platform.is_xpu():
+        return True
+    if current_platform.is_cuda():
+        return current_platform.has_device_capability(100)
+    return False
+
+
+def resolve_moe_use_td() -> bool:
+    """Tri-state resolver for ``VLLM_TRITON_USE_TD``.
+
+    Unset auto-selects the TD path on XPU only, mirroring the attention
+    dispatcher in ``triton_attn.py``. ``1``/``0`` force it on/off regardless
+    of hardware; forcing ``1`` where it cannot compile (see
+    ``moe_use_td_hw_supported``) fails at ptxas. Blackwell CUDA (sm100+) can
+    compile it but is opt-in only, pending validation.
+    """
+    override = envs.VLLM_TRITON_USE_TD
+    if override is None:
+        return current_platform.is_xpu()
+    return override
+
+
+_warned_moe_use_td_ineffective = False
+
+
+def warn_if_moe_use_td_ineffective(
+    active_backend: str, is_quantized: bool = False
+) -> None:
+    """One-shot warning when ``VLLM_TRITON_USE_TD`` is set but ignored.
+
+    Fires when the user set the env explicitly and either (a) the active
+    MoE backend is not the fused Triton kernel, or (b) the model is
+    quantized (the TD path falls back to the pointer path under any
+    quantization).
+    """
+    global _warned_moe_use_td_ineffective
+    if _warned_moe_use_td_ineffective:
+        return
+    if envs.VLLM_TRITON_USE_TD is None:
+        return
+    is_triton = active_backend.upper() == "TRITON"
+    if is_triton and not is_quantized:
+        return
+    if not is_triton:
+        reason = (
+            f"the active MoE backend is {active_backend!r}; pass "
+            "`--moe-backend triton` to enable the tensor-descriptor path"
+        )
+    else:
+        reason = (
+            "the model uses quantized MoE weights; the TD path is "
+            "currently restricted to non-quantized weights and falls "
+            "back to the pointer path"
+        )
+    logger.warning(
+        "VLLM_TRITON_USE_TD is set to %s but %s.",
+        envs.VLLM_TRITON_USE_TD,
+        reason,
+    )
+    _warned_moe_use_td_ineffective = True

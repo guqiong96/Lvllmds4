@@ -108,11 +108,6 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
-    calculate_kv_scales: bool = False
-    """Deprecated: This option is deprecated and will be removed in v0.19.
-    It enables dynamic calculation of `k_scale` and `v_scale` when
-    kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
-    checkpoint if available. Otherwise, the scales will default to 1.0."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -137,14 +132,25 @@ class CacheConfig:
     still be controlled by mamba_cache_dtype). If set to 'auto', the data type
     for the ssm state will be determined by mamba_cache_dtype."""
     mamba_cache_mode: MambaCacheMode = "none"
-    """The cache strategy for Mamba layers.
+    """The cache strategy for Mamba layers:
+
     - "none": set when prefix caching is disabled.
-    - "all": cache the mamba state of all tokens at position i * block_size. This is
-           the default behavior (for models that support it) when prefix caching is
-           enabled.
+    - "all": cache the mamba state of all tokens at position i * block_size.
     - "align": only cache the mamba state of the last token of each scheduler step and
-           when the token is at position i * block_size.
+      when the token is at position i * block_size. This is the default when prefix
+      caching is enabled.
     """
+    replayssm_buffer_len: int = Field(default=16, gt=0)
+    """ReplaySSM history buffer length B: with use_replayssm, standard decode
+    caches recent SSM inputs in a size-B ring buffer and flushes the checkpoint
+    state to HBM every B steps. Default 16."""
+    use_replayssm: bool = False
+    """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
+    the per-step full-state store, writing the checkpoint back only on flush.
+    Requires mamba_cache_mode 'none' or 'align' (prefix caching) and the Triton
+    mamba backend; standard (non-speculative) decode only. In align mode flushes
+    are most efficient when mamba_block_size is a multiple of replayssm_buffer_len,
+    but this is not required."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -159,6 +165,13 @@ class CacheConfig:
     for hybrid models where requests occupy multiple KV cache groups."""
     kv_cache_max_concurrency: float | None = field(default=None, init=False)
     """Per-DP-engine maximum concurrency at max_model_len tokens."""
+    requested_block_size: int | None = field(default=None, init=False)
+    """The resolved block size before engine init reduces ``block_size`` to
+    the minimum KV-cache-group granularity. On hybrid models the groups have
+    different block sizes (DeepSeek-V4: 256 attention / 64 SWA / 8 and 4
+    compressor state), so ``block_size`` in metrics can be far smaller than
+    the value the user passed while the attention group still honors it;
+    this field preserves that value. None until KV cache initialization."""
 
     kv_sharing_fast_prefill: bool = False
     """In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
@@ -220,6 +233,7 @@ class CacheConfig:
             "num_cpu_blocks",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",
+            "requested_block_size",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
         }
@@ -258,18 +272,6 @@ class CacheConfig:
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
         return self
-
-    @field_validator("calculate_kv_scales", mode="after")
-    @classmethod
-    def _warn_deprecated_calculate_kv_scales(cls, calculate_kv_scales: bool) -> bool:
-        if calculate_kv_scales:
-            logger.warning(
-                "The `--calculate-kv-scales` option is deprecated and will "
-                "be removed in v0.19. The scales will be loaded from the "
-                "model checkpoint if available, otherwise they default to "
-                "1.0."
-            )
-        return calculate_kv_scales
 
     @field_validator("cache_dtype", mode="after")
     @classmethod

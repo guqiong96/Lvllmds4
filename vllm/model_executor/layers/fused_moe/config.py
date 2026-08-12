@@ -1066,7 +1066,9 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        return self.use_ep and (self.dp_size > 1 or self.is_sequence_parallel)
+        return self.use_ep and (
+            self.dp_size > 1 or self.pcp_size > 1 or self.is_sequence_parallel
+        )
 
     @property
     def use_deepep_ht_kernels(self):
@@ -1148,9 +1150,9 @@ class FusedMoEParallelConfig:
         level's of parallelism to use in the fused moe layer.
 
         Args:
-            tp_size_ (int): `tp_size` passed into the FusedMoE constructor.
-            pcp_size_ (int): `pcp_size` passed into the FusedMoE constructor.
-            dp_size_ (int): `dp_size` passed into the FusedMoE constructor.
+            tp_size_ (int): `tp_size` passed into the FusedMoEFactory constructor.
+            pcp_size_ (int): `pcp_size` passed into the FusedMoEFactory constructor.
+            dp_size_ (int): `dp_size` passed into the FusedMoEFactory constructor.
             vllm_parallel_config (ParallelConfig): vLLM's parallel config
                 object which contains the `enable_expert_parallel` flag.
 
@@ -1328,6 +1330,10 @@ class FusedMoEConfig:
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
 
+    # SituGLU parameters used by Kimi sit(u/v2) activations.
+    activation_situ_beta: float | None = None
+    activation_situ_linear_beta: float | None = None
+
     max_capture_size: int = 0
 
     # Set by __post_init__
@@ -1384,6 +1390,11 @@ class FusedMoEConfig:
     @property
     def is_act_and_mul(self) -> bool:
         return self.activation.is_gated
+
+    @property
+    def w13_num_shards(self) -> int:
+        """Number of shards fused into w13: gate and up for gated, up only."""
+        return 2 if self.is_act_and_mul else 1
 
     @property
     def tp_size(self):

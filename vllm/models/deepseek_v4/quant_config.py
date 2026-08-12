@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, cast
 
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe import (
@@ -19,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_LAYER_INDEX_RE = re.compile(r"\blayers\.(\d+)\b")
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -50,6 +52,7 @@ class DeepseekV4FP8Config(Fp8Config):
         super().__init__(*args, **kwargs)
         self._resolved_expert_dtype: str | None = None
         self._resolved_moe_quant_algo: str | None = None
+        self._resolved_num_hidden_layers: int | None = None
         self._nvfp4_config: ModelOptNvFp4Config | None = None
         # ``is_scale_e8m0`` is a property that resolves on first read,
         # by which time the current vllm_config has been set.
@@ -99,6 +102,29 @@ class DeepseekV4FP8Config(Fp8Config):
         self._resolve_moe_overrides()
         return self._resolved_moe_quant_algo or ""
 
+    def _is_draft_module_prefix(self, prefix: str) -> bool:
+        """Whether ``prefix`` addresses a speculative draft-module layer.
+
+        NVFP4 conversions (modelopt ``cast_mxfp4_to_nvfp4``) quantize only the
+        main ``num_hidden_layers`` stack; the draft module (MTP/DSpark, runtime
+        layer ids >= num_hidden_layers) keeps the checkpoint's native MXFP4
+        experts. Routing those through the NVFP4 method decodes MXFP4 bits as
+        NVFP4 noise: the engine serves, but draft acceptance collapses to 0%.
+        """
+        m = _LAYER_INDEX_RE.search(prefix)
+        if m is None:
+            return False
+        if self._resolved_num_hidden_layers is None:
+            try:
+                hf_config = get_current_vllm_config().model_config.hf_config
+            except Exception:
+                return False
+            self._resolved_num_hidden_layers = getattr(
+                hf_config, "num_hidden_layers", None
+            )
+        n = self._resolved_num_hidden_layers
+        return n is not None and int(m.group(1)) >= n
+
     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
         if self._nvfp4_config is None:
             from vllm.model_executor.layers.quantization.modelopt import (
@@ -117,19 +143,58 @@ class DeepseekV4FP8Config(Fp8Config):
     def get_name(cls) -> QuantizationMethods:
         return "deepseek_v4_fp8"
 
+    @staticmethod
+    def _is_quark_mxfp4_ocp(hf_quant_cfg: dict) -> bool:
+        """True for AMD-Quark exports whose global scheme is MXFP4."""
+        weight = (hf_quant_cfg.get("global_quant_config") or {}).get("weight")
+        # A non-dict weight (e.g. a list of multiple specs) means not an OCP
+        # MXFP4 scheme (e.g. NVFP4 with 2-level scale).
+        if not isinstance(weight, dict):
+            return False
+        return (
+            weight.get("dtype") == "fp4"
+            and weight.get("qscheme") == "per_group"
+            and weight.get("group_size") == 32
+        )
+
     @classmethod
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
         if not (
             isinstance(hf_quant_cfg, dict)
-            and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")
+            and (
+                hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")
+                or (
+                    hf_quant_cfg.get("quant_method") == "quark"
+                    and cls._is_quark_mxfp4_ocp(hf_quant_cfg)
+                )
+            )
         ):
             return None
         model_type = getattr(hf_config, "model_type", None)
         if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
         return None
+
+    @classmethod
+    def from_config(cls, config: dict) -> DeepseekV4FP8Config:
+        # Reroute AMD-Quark fused shared expert MXFP4 checkpoints onto the fp8
+        # path: the runtime layout matches the DeepSeek-native fp8 checkpoint,
+        # so translate the schema into format Fp8Config.from_config expects.
+        if config.get("quant_method") == "quark":
+            quark_exclude = config.get("exclude") or []
+            config = {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+                "ignored_layers": [
+                    name for name in quark_exclude if isinstance(name, str)
+                ],
+            }
+        return cast("DeepseekV4FP8Config", super().from_config(config))
 
     def get_quant_method(self, layer, prefix):
         if isinstance(layer, RoutedExperts):
@@ -140,7 +205,9 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                if self.moe_quant_algo == "NVFP4" and not self._is_draft_module_prefix(
+                    prefix
+                ):
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )
@@ -157,4 +224,6 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4"
+        return self.moe_quant_algo != "NVFP4" or self._is_draft_module_prefix(
+            prefix
+        )

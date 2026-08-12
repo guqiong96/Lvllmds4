@@ -22,9 +22,8 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
-    mhc_post_tilelang,
+    mhc_fused_post_pre_tilelang_reuse_residual,
+    mhc_post_hc_head_tilelang,
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.fused_moe import (
@@ -39,7 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import get_draft_quant_config
-from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
+from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
@@ -60,6 +59,7 @@ from .dspark_triton import (
     dspark_triton_attention,
 )
 from .model import (
+    DeepseekV4Model,
     DeepseekV4MoE,
     _select_dsv4_attn_cls,
     make_deepseek_v4_expert_params_mapping,
@@ -125,6 +125,16 @@ def _apply_rope_gptj_last(
     return out
 
 
+# DSpark draft layers run their MoE on the non-sequence-parallel convention
+# regardless of how the target model is parallelized. Both the layer that builds
+# the MoE and the loader that decides whether to pad block-quantized
+# shared-expert weights must agree on this, so they read the same constant: the
+# two used to derive it independently and disagreed whenever
+# use_sequence_parallel_moe was set, which slices the padded weights on the
+# wrong block boundary across TP ranks.
+_DSPARK_USE_SEQUENCE_PARALLEL = False
+
+
 class DeepSeekV4DSparkLayer(nn.Module):
     def __init__(
         self,
@@ -156,7 +166,11 @@ class DeepSeekV4DSparkLayer(nn.Module):
             topk_indices_buffer=None,
             aux_stream_list=None,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{runtime_prefix}.ffn")
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{runtime_prefix}.ffn",
+            use_sequence_parallel=_DSPARK_USE_SEQUENCE_PARALLEL,
+        )
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
@@ -626,7 +640,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang_reuse_residual(
                 x,
                 residual,
                 post_mix,
@@ -649,7 +663,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang_reuse_residual(
             x,
             residual,
             post_mix,
@@ -674,7 +688,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.ffn.finalize_mega_moe_weights()
 
 
-class DeepSeekV4DSpark(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module):
     """DSpark draft model for fixed-block speculative decoding."""
 
     uses_query_start_loc_context_kv = True
@@ -699,13 +713,17 @@ class DeepSeekV4DSpark(nn.Module):
         self.max_batch = max(1, int(vllm_config.scheduler_config.max_num_seqs))
         hidden_size = int(config.hidden_size)
         dtype = vllm_config.model_config.dtype
-        quant_config = get_draft_quant_config(vllm_config)
+        self.quant_config = get_draft_quant_config(vllm_config)
+        self.pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not _DSPARK_USE_SEQUENCE_PARALLEL
+        )
         self.dspark_aux_hidden_size = hidden_size * len(self.target_layer_ids)
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             hidden_size,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
             prefix=f"{prefix}embed_tokens",
         )
         self.main_proj = ReplicatedLinear(
@@ -713,7 +731,7 @@ class DeepSeekV4DSpark(nn.Module):
             hidden_size,
             bias=False,
             params_dtype=dtype,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
             prefix=f"{prefix}mtp.0.main_proj",
             return_bias=False,
         )
@@ -917,9 +935,11 @@ class DeepSeekV4DSpark(nn.Module):
                 res_mix,
                 residual,
             )
-        x = mhc_post_tilelang(x, residual, post_mix, res_mix)
-        x = hc_head_fused_kernel_tilelang(
+        x = mhc_post_hc_head_tilelang(
             x,
+            residual,
+            post_mix,
+            res_mix,
             self.hc_head_fn,
             self.hc_head_scale,
             self.hc_head_base,
@@ -939,6 +959,13 @@ class DeepSeekV4DSpark(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.head, hidden_states)
+
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Full-vocab draft: base logits, no d2t scatter.
+        return self.compute_logits(hidden_states)
+
+    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        return draft_ids  # full-vocab: draft ids are target ids
 
     def _markov_w1_embedding(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(prev_token_ids.long())
@@ -1043,6 +1070,12 @@ class DeepSeekV4DSpark(nn.Module):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
+            if ".shared_experts.w2" in name:
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
+            if self.pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if not name.startswith("layers."):
                     continue
@@ -1089,10 +1122,6 @@ class DeepSeekV4DSpark(nn.Module):
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
-                if ".shared_experts.w2" in name:
-                    name = name.replace(
-                        ".shared_experts.w2", ".shared_experts.down_proj"
-                    )
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias",

@@ -79,7 +79,8 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,
                        const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any) {
+                       bool is_src_access_order_any,
+                       bool use_batch_api) {
   STD_TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
   STD_TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
   STD_TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
@@ -102,85 +103,89 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
 
   const cudaStream_t stream = get_current_cuda_stream();
 
-  // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
-  // single driver call, amortizing per-copy submission overhead. int64_t
-  // and CUdeviceptr/void*/size_t are all 8 bytes on 64-bit platforms, so we
-  // reinterpret_cast the tensor data directly to avoid copies.
-  static_assert(sizeof(size_t) == sizeof(int64_t));
-#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
-  static_assert(sizeof(CUdeviceptr) == sizeof(int64_t));
-  // Resolve cuMemcpyBatchAsync at runtime via cuGetProcAddress so that
-  // binaries compiled with CUDA 12.8+ still work on older drivers, and
-  // we avoid the CUDA 13.0 header remapping (#define to _v2 signature).
-  // The function pointer is cached after the first call.
-  using BatchFn =
-      CUresult (*)(CUdeviceptr*, CUdeviceptr*, size_t*, size_t,
-                   CUmemcpyAttributes*, size_t*, size_t, size_t*, CUstream);
-  static BatchFn batch_fn = []() -> BatchFn {
-    CUdriverProcAddressQueryResult sym_status;
-    void* fn_ptr = nullptr;
-    CUresult res = cuGetProcAddress("cuMemcpyBatchAsync", &fn_ptr, 12080,
-                                    CU_GET_PROC_ADDRESS_DEFAULT, &sym_status);
-    if (res != CUDA_SUCCESS || fn_ptr == nullptr) {
-      return nullptr;
-    }
-    return reinterpret_cast<BatchFn>(fn_ptr);
-  }();
+  // When use_batch_api is false, skip cuMemcpyBatchAsync/hipMemcpyBatchAsync
+  // entirely and use the per-descriptor cudaMemcpyAsync fallback. This is
+  // the durable fix for compact-transfer cuMemcpyBatchAsync segfaults with
+  // very large descriptor counts.
+  if (use_batch_api) {
+    // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
+    // single driver call, amortizing per-copy submission overhead. int64_t
+    // and CUdeviceptr/void*/size_t are all 8 bytes on 64-bit platforms, so we
+    // reinterpret_cast the tensor data directly to avoid copies.
+    static_assert(sizeof(size_t) == sizeof(int64_t));
+  #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+    static_assert(sizeof(CUdeviceptr) == sizeof(int64_t));
+    // Resolve cuMemcpyBatchAsync at runtime via cuGetProcAddress so that
+    // binaries compiled with CUDA 12.8+ still work on older drivers, and
+    // we avoid the CUDA 13.0 header remapping (#define to _v2 signature).
+    // The function pointer is cached after the first call.
+    using BatchFn =
+        CUresult (*)(CUdeviceptr*, CUdeviceptr*, size_t*, size_t,
+                     CUmemcpyAttributes*, size_t*, size_t, size_t*, CUstream);
+    static BatchFn batch_fn = []() -> BatchFn {
+      CUdriverProcAddressQueryResult sym_status;
+      void* fn_ptr = nullptr;
+      CUresult res = cuGetProcAddress("cuMemcpyBatchAsync", &fn_ptr, 12080,
+                                      CU_GET_PROC_ADDRESS_DEFAULT, &sym_status);
+      if (res != CUDA_SUCCESS || fn_ptr == nullptr) {
+        return nullptr;
+      }
+      return reinterpret_cast<BatchFn>(fn_ptr);
+    }();
 
-  // cuMemcpyBatchAsync rejects the legacy default stream (handle 0 /
-  // cudaStreamLegacy) with CUDA_ERROR_INVALID_VALUE; route it to the per-copy
-  // fallback below, which is correct on any stream. Real and per-thread-default
-  // streams take the batch fast path.
-  const bool usable_stream = stream != nullptr && stream != cudaStreamLegacy;
-  if (batch_fn != nullptr && usable_stream) {
-    CUmemcpyAttributes attr = {};
-    // ANY lets the DMA engine prefetch source bytes out of stream order,
-    // which is only safe when no GPU stream is concurrently writing the
-    // source.
-    attr.srcAccessOrder = is_src_access_order_any
-                              ? CU_MEMCPY_SRC_ACCESS_ORDER_ANY
-                              : CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
-    size_t attrs_idx = 0;
-    size_t fail_idx = 0;
-    CUresult result = batch_fn(reinterpret_cast<CUdeviceptr*>(dst_data),
-                               reinterpret_cast<CUdeviceptr*>(src_data),
-                               reinterpret_cast<size_t*>(size_data),
-                               static_cast<size_t>(n), &attr, &attrs_idx, 1,
-                               &fail_idx, static_cast<CUstream>(stream));
-    STD_TORCH_CHECK(result == CUDA_SUCCESS,
-                    "cuMemcpyBatchAsync failed at index ", fail_idx,
-                    " with error ", result);
-    return;
-  }
-#elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
-  // ROCm 7.1+ exposes hipMemcpyBatchAsync. The 7.2.1 implementation early-
-  // returns hipErrorNotSupported whenever numAttrs > 0 (see ROCm/clr @
-  // rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so call with
-  // numAttrs=0.
-  {
-    hipMemcpyAttributes attr = {};
-    size_t attrs_idx = 0;
-    size_t fail_idx = 0;
-    hipError_t result = hipMemcpyBatchAsync(
-        reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
-        reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n), &attr,
-        &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
-    STD_TORCH_CHECK(result == hipSuccess,
-                    "hipMemcpyBatchAsync failed at index ", fail_idx,
-                    " with error ", result);
-    return;
-  }
-#endif
-  {
-    // Fallback for CUDA < 12.8, older CUDA drivers, and ROCm < 7.1:
-    // individual async copies. cudaMemcpyDefault lets the driver infer
-    // direction from pointer types.
-    for (int64_t i = 0; i < n; i++) {
-      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                      reinterpret_cast<void*>(src_data[i]),
-                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
-                      stream);
+    // cuMemcpyBatchAsync rejects the legacy default stream (handle 0 /
+    // cudaStreamLegacy) with CUDA_ERROR_INVALID_VALUE; route it to the per-copy
+    // fallback below, which is correct on any stream. Real and per-thread-default
+    // streams take the batch fast path.
+    const bool usable_stream = stream != nullptr && stream != cudaStreamLegacy;
+    if (batch_fn != nullptr && usable_stream) {
+      CUmemcpyAttributes attr = {};
+      // ANY lets the DMA engine prefetch source bytes out of stream order,
+      // which is only safe when no GPU stream is concurrently writing the
+      // source.
+      attr.srcAccessOrder = is_src_access_order_any
+                                ? CU_MEMCPY_SRC_ACCESS_ORDER_ANY
+                                : CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+      size_t attrs_idx = 0;
+      size_t fail_idx = 0;
+      CUresult result = batch_fn(reinterpret_cast<CUdeviceptr*>(dst_data),
+                                  reinterpret_cast<CUdeviceptr*>(src_data),
+                                  reinterpret_cast<size_t*>(size_data),
+                                  static_cast<size_t>(n), &attr, &attrs_idx, 1,
+                                  &fail_idx, static_cast<CUstream>(stream));
+      STD_TORCH_CHECK(result == CUDA_SUCCESS,
+                      "cuMemcpyBatchAsync failed at index ", fail_idx,
+                      " with error ", result);
+      return;
     }
+  #elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+    // ROCm 7.1+ exposes hipMemcpyBatchAsync. The 7.2.1 implementation early-
+    // returns hipErrorNotSupported whenever numAttrs > 0 (see ROCm/clr @
+    // rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so call with
+    // numAttrs=0.
+    {
+      hipMemcpyAttributes attr = {};
+      size_t attrs_idx = 0;
+      size_t fail_idx = 0;
+      hipError_t result = hipMemcpyBatchAsync(
+          reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
+          reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n), &attr,
+          &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
+      STD_TORCH_CHECK(result == hipSuccess,
+                      "hipMemcpyBatchAsync failed at index ", fail_idx,
+                      " with error ", result);
+      return;
+    }
+  #endif
+  }
+  // Fallback for CUDA < 12.8, older CUDA drivers, ROCm < 7.1, or when
+  // use_batch_api is false: individual async copies. cudaMemcpyDefault lets
+  // the driver infer direction from pointer types.
+  for (int64_t i = 0; i < n; i++) {
+    cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                    reinterpret_cast<void*>(src_data[i]),
+                    static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
+                    stream);
   }
 }
 
@@ -441,6 +446,55 @@ __global__ void concat_and_cache_mla_kernel(
 
   copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
   copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+}
+
+// Grouped variant of concat_and_cache_mla: inserts the context K/V for every
+// draft layer in a single launch. Grid is (num_tokens, num_layers); each layer
+// reads its own cache base pointer from kv_cache_ptrs (same pointer-array
+// pattern as copy_blocks_kernel). bf16 only, so it is a raw 16-bit copy with no
+// scaling or quantization; scalar_t is uint16_t for portability.
+template <typename scalar_t>
+__global__ void concat_and_cache_mla_grouped_kernel(
+    const scalar_t* __restrict__ kv_c,  // [num_layers, num_tokens,
+                                        // kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,  // [num_layers, num_tokens, pe_dim]
+    const int64_t* __restrict__ kv_cache_ptrs,  // [num_layers]
+    const int64_t* __restrict__ slot_mapping,   // [num_layers, num_tokens]
+    const int64_t kv_c_layer_stride, const int64_t kv_c_token_stride,
+    const int64_t k_pe_layer_stride, const int64_t k_pe_token_stride,
+    const int64_t slot_layer_stride, const int64_t block_stride,
+    const int64_t entry_stride, const int kv_lora_rank, const int pe_dim,
+    const int block_size) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t layer_idx = blockIdx.y;
+  const int64_t slot_idx =
+      slot_mapping[layer_idx * slot_layer_stride + token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+
+  scalar_t* __restrict__ kv_cache =
+      reinterpret_cast<scalar_t*>(kv_cache_ptrs[layer_idx]);
+  const scalar_t* __restrict__ kv_c_layer =
+      kv_c + layer_idx * kv_c_layer_stride;
+  const scalar_t* __restrict__ k_pe_layer =
+      k_pe + layer_idx * k_pe_layer_stride;
+
+  auto copy = [&](const scalar_t* __restrict__ src, int64_t src_token_stride,
+                  int size, int offset) {
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+      const int64_t src_idx = token_idx * src_token_stride + i;
+      const int64_t dst_idx =
+          block_idx * block_stride + block_offset * entry_stride + i + offset;
+      kv_cache[dst_idx] = src[src_idx];
+    }
+  };
+
+  copy(kv_c_layer, kv_c_token_stride, kv_lora_rank, 0);
+  copy(k_pe_layer, k_pe_token_stride, pe_dim, kv_lora_rank);
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
@@ -902,6 +956,53 @@ void concat_and_cache_mla(
   }
 }
 
+void concat_and_cache_mla_grouped(
+    torch::stable::Tensor& kv_c,  // [num_layers, num_tokens, kv_lora_rank]
+    torch::stable::Tensor& k_pe,  // [num_layers, num_tokens, pe_dim]
+    torch::stable::Tensor& kv_cache_ptrs,  // [num_layers] int64, on device
+    torch::stable::Tensor& slot_mapping,   // [num_layers, num_tokens] int64
+    int64_t block_size, int64_t block_stride, int64_t entry_stride) {
+  int num_layers = kv_c.size(0);
+  int num_tokens = kv_c.size(1);
+  int kv_lora_rank = kv_c.size(2);
+  int pe_dim = k_pe.size(2);
+
+  STD_TORCH_CHECK(
+      kv_c.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
+          k_pe.scalar_type() == torch::headeronly::ScalarType::BFloat16,
+      "concat_and_cache_mla_grouped only supports a bf16 KV cache; got kv_c=",
+      kv_c.scalar_type(), ", k_pe=", k_pe.scalar_type());
+  STD_TORCH_CHECK(
+      kv_cache_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
+      "kv_cache_ptrs must be int64");
+
+  if (num_tokens == 0 || num_layers == 0) {
+    return;
+  }
+
+  const int64_t kv_c_layer_stride = kv_c.stride(0);
+  const int64_t kv_c_token_stride = kv_c.stride(1);
+  const int64_t k_pe_layer_stride = k_pe.stride(0);
+  const int64_t k_pe_token_stride = k_pe.stride(1);
+  const int64_t slot_layer_stride = slot_mapping.stride(0);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      kv_c.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+
+  dim3 grid(num_tokens, num_layers);
+  dim3 block(std::min(kv_lora_rank, 512));
+  vllm::concat_and_cache_mla_grouped_kernel<uint16_t>
+      <<<grid, block, 0, stream>>>(
+          reinterpret_cast<const uint16_t*>(kv_c.data_ptr()),
+          reinterpret_cast<const uint16_t*>(k_pe.data_ptr()),
+          kv_cache_ptrs.const_data_ptr<int64_t>(),
+          slot_mapping.const_data_ptr<int64_t>(), kv_c_layer_stride,
+          kv_c_token_stride, k_pe_layer_stride, k_pe_token_stride,
+          slot_layer_stride, block_stride, entry_stride, kv_lora_rank, pe_dim,
+          block_size);
+}
+
 namespace vllm {
 
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
@@ -1025,6 +1126,9 @@ __global__ void gather_and_maybe_dequant_cache(
     batch_offset += offset;
     int32_t block_table_id = batch_offset / block_size;
     int32_t slot_id = batch_offset % block_size;
+    // seq_starts may push the block index past the end of the batch's block
+    // table row.
+    if (block_table_id >= block_table_stride) continue;
     int32_t block_table_offset = batch_id * block_table_stride + block_table_id;
     int32_t block_id = block_table[block_table_offset];
     int64_t cache_offset =

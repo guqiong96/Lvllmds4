@@ -793,6 +793,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     attn_metadata.block_table[:num_decodes],
                     block_size,
                     is_valid,
+                    output_buffers=self._global_topk_output_buffers(
+                        self.topk_indices_buffer[:num_decode_tokens]
+                    ),
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
@@ -1124,8 +1127,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 top_k,
                 chunk_m,
                 chunk_n,
-                combined_indices=combined_indices_buffer,
-                combined_lens=combined_lens_buffer,
+                out=(combined_indices_buffer, combined_lens_buffer),
             )
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(

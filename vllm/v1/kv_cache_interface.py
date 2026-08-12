@@ -21,6 +21,8 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_offload.compact_geometry import CompactTransportSignature
+    from vllm.v1.kv_offload.config import CompactGroupSliceConfig
 
 logger = init_logger(__name__)
 
@@ -43,6 +45,7 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     NVFP4 = 5  # packed fp4 data + fp8 block scales
+    TURBOQUANT = 6  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
 
     @property
     def is_per_token_head(self) -> bool:
@@ -58,6 +61,11 @@ class KVQuantMode(IntEnum):
         """True for NVFP4 packed quantization mode."""
         return self == KVQuantMode.NVFP4
 
+    @property
+    def is_turboquant(self) -> bool:
+        """True for turboquant quantization mode."""
+        return self == KVQuantMode.TURBOQUANT
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
@@ -69,6 +77,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
+        return KVQuantMode.TURBOQUANT
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -218,14 +228,9 @@ class AttentionSpec(KVCacheSpec):
         )
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
-        # Attention KV is token-interleaved across DCP/PCP ranks, so each rank
-        # only stores max_len // (dcp * pcp) tokens per request.
         parallel_config = vllm_config.parallel_config
-        total_cp_size = (
-            parallel_config.decode_context_parallel_size
-            * parallel_config.prefill_context_parallel_size
-        )
-        return cdiv(max_len, self.block_size * total_cp_size)
+        kv_shard_count = parallel_config.decode_context_parallel_size
+        return cdiv(max_len, self.block_size * kv_shard_count)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -263,11 +268,8 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
-        # Note(hc): each dcp rank only need save
-        # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        if dcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -393,6 +395,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    # Marks draft groups that flatten a non-causal query block into decode rows.
+    non_causal_multi_token_decode: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -442,7 +446,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             "quantization method, compress ratio, model version, and KV block "
             "stride indexing."
         )
-        return cls(
+        merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
@@ -453,7 +457,17 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
+        for spec in specs:
+            for f in fields(AttentionSpec):
+                assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
+                    "All attention layers in the same KV cache group must have "
+                    "the same attention spec."
+                )
+        return merged_spec
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -843,6 +857,20 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
         return max_num_pages * self.page_size_bytes
 
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        # Metadata builders are constructed from the per-layer spec, so the base
+        # cdiv(max_len, block_size) would drop its DCP sharding and size the
+        # block table wider than those builders expect.
+        widths = {
+            spec.max_num_blocks_per_req(vllm_config, max_len)
+            for spec in self.kv_cache_specs.values()
+        }
+        assert len(widths) == 1, (
+            "All layers in the same KV cache group must need the same number "
+            f"of block table entries, got {sorted(widths)}."
+        )
+        return next(iter(widths))
+
     @classmethod
     def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
         """
@@ -976,10 +1004,46 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
 
+    # Compact aggregate signature: transported by the scheduler through
+    # get_kv_cache_configs to every worker.  Populated before per-worker
+    # projection when enable_compact_layout is true.  None for legacy configs.
+    # Tuple order matches kv_cache_groups order.
+    compact_aggregate_signature: tuple[CompactTransportSignature, ...] | None = None
+
+    # Worker-local physical packed slice geometry. Populated on rich worker
+    # configs before scheduler projection and explicitly cleared from the
+    # collapsed scheduler copy. None for legacy and scheduler configs.
+    compact_slice_accounting: tuple[CompactGroupSliceConfig, ...] | None = None
+
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_mixed_precision_kv_cache(self) -> bool:
+        """Whether attention groups store their KV cache at more than one precision."""
+        kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()
+        for group in self.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            group_specs = (
+                list(group_spec.kv_cache_specs.values())
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else [group_spec]
+            )
+            kv_cache_precisions.update(
+                (spec.dtype, spec.kv_quant_mode)
+                for spec in group_specs
+                if isinstance(spec, AttentionSpec)
+            )
+        return len(kv_cache_precisions) > 1
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
-        return self.has_mamba_layers
+        """Whether newly allocated KV cache blocks must be zeroed before use.
+
+        Required for Mamba layers, whose state is read before it is fully written
+        (#35219), and for mixed-precision caches, where a block reused across
+        groups can be reinterpreted under a different precision and decode stale
+        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        """
+        return self.has_mamba_layers or self.has_mixed_precision_kv_cache

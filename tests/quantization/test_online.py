@@ -9,6 +9,7 @@ from tests.quantization.utils import (
     _test_online_quant_peak_mem_impl,
     is_quant_method_supported,
 )
+from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
@@ -18,6 +19,7 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
 )
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
+    _quantize_moe_weight_to_nvfp4,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
@@ -89,6 +91,9 @@ def test_online_quantization(
     if use_rocm_aiter:
         monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
 
+    if current_platform.is_xpu() and quant_scheme == "fp8_per_block":
+        pytest.skip("Skip test for online fp8_per_block on XPU platform.")
+
     # `LLM.apply_model` requires pickling a function.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -121,7 +126,7 @@ def test_online_quantization(
             if moe is not None:
                 assert isinstance(moe._quant_method, expected_moe_cls)
 
-            if current_platform.is_cuda():
+            if current_platform.is_cuda() or current_platform.is_xpu():
                 assert o_proj.weight.dtype == torch.float8_e4m3fn
             elif current_platform.is_rocm():
                 assert o_proj.weight.dtype == current_platform.fp8_dtype()
@@ -179,6 +184,41 @@ def test_online_nvfp4_per_token_moe(vllm_runner, monkeypatch) -> None:
         llm.apply_model(check_model)
         outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
         print(outputs[0][1])
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    ),
+    reason="NVFP4 weight quantization needs a Blackwell (SM100) GPU.",
+)
+def test_online_nvfp4_quantizes_original_expert_weights() -> None:
+    torch.manual_seed(0)
+    weight = torch.randn(2, 32, 32, device="cuda", dtype=torch.bfloat16)
+
+    quantized, block_scale, global_decode_scale = _quantize_moe_weight_to_nvfp4(weight)
+    global_encode_scale = 1.0 / global_decode_scale
+    expected = [
+        scaled_fp4_quant(
+            expert_weight,
+            expert_scale,
+            is_sf_swizzled_layout=False,
+        )
+        for expert_weight, expert_scale in zip(
+            weight,
+            global_encode_scale,
+            strict=True,
+        )
+    ]
+
+    assert torch.equal(
+        quantized,
+        torch.stack([expert_weight for expert_weight, _ in expected]),
+    )
+    assert torch.equal(
+        block_scale,
+        torch.stack([expert_scale for _, expert_scale in expected]),
+    )
 
 
 @pytest.mark.skipif(

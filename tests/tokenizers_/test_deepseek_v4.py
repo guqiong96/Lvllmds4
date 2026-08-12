@@ -15,8 +15,16 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
-from vllm.tokenizers.deepseek_v4_encoding import encode_arguments_to_dsml
+from vllm.tokenizers.deepseek_v4_encoding import (
+    REASONING_EFFORT_PROMPTS,
+    encode_arguments_to_dsml,
+)
 from vllm.tokenizers.registry import TokenizerRegistry
+
+# Thinking defaults on and, when on, reasoning effort defaults to "high", so an
+# unqualified request now carries this preamble at message index 0. Tests below
+# reference the table rather than the wording: the tier is the contract.
+_DEFAULT_EFFORT_PREAMBLE = REASONING_EFFORT_PROMPTS["high"]
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "deepseek_v4"
 
@@ -82,13 +90,16 @@ def test_deepseek_v4_tokenizer_registered():
     )
 
 
-def test_deepseek_v4_defaults_to_chat_mode():
+def test_deepseek_v4_defaults_to_thinking_with_high_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
     )
 
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜Assistant｜><think>")
 
 
 @pytest.mark.parametrize("kwargs", [{"thinking": True}, {"enable_thinking": True}])
@@ -99,7 +110,21 @@ def test_deepseek_v4_enables_thinking_with_compatible_kwargs(kwargs):
         **kwargs,
     )
 
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
+@pytest.mark.parametrize("kwargs", [{"thinking": False}, {"enable_thinking": False}])
+def test_deepseek_v4_explicitly_disables_thinking(kwargs):
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        tokenize=False,
+        **kwargs,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
 
 
 def test_deepseek_v4_honors_official_thinking_request_field():
@@ -122,7 +147,11 @@ def test_deepseek_v4_honors_official_thinking_request_field():
 
     assert chat_kwargs["thinking"] is True
     assert chat_kwargs["enable_thinking"] is True
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>"
+        + _DEFAULT_EFFORT_PREAMBLE
+        + "<｜User｜>Hello<｜Assistant｜><think>"
+    )
 
 
 def test_deepseek_v4_defaults_to_official_thinking_for_openai_request():
@@ -192,7 +221,9 @@ def test_deepseek_v4_preserves_official_prefix_assistant_message():
 
     assert conversation[1]["prefix"] is True
     assert conversation[1]["wo_eos"] is True
-    assert prompt.endswith("<｜Assistant｜></think>```python\n")
+    # Thinking is on by default now, so the prefix turn opens and closes an
+    # empty thinking block before the prefix content instead of only closing one.
+    assert prompt.endswith("<｜Assistant｜><think></think>```python\n")
     assert not prompt.endswith("<｜end▁of▁sentence｜>")
 
 
@@ -253,7 +284,10 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert "</｜DSML｜tool_calls>" in prompt
     assert "function_calls" not in prompt
     assert '"name": "get_weather"' in prompt
-    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜><think>")
 
 
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
@@ -373,8 +407,17 @@ def test_deepseek_v4_renders_openai_history_tool_call_with_null_arguments():
     assert "<｜DSML｜parameter" not in prompt
 
 
-@pytest.mark.parametrize("reasoning_effort", ["minimal", "low", "medium", "high"])
-def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_prefix"),
+    [
+        ("low", "<｜begin▁of▁sentence｜><｜User｜>Hello"),
+        ("high", "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
+        ("max", "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
+    ],
+)
+def test_deepseek_v4_renders_0731_reasoning_effort_prompts(
+    reasoning_effort, expected_prefix
+):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -383,7 +426,7 @@ def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
     )
 
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert "Reasoning Effort: Absolute maximum" not in prompt
+    assert prompt.startswith(expected_prefix)
 
 
 def test_deepseek_v4_none_reasoning_effort_disables_thinking():
@@ -401,11 +444,11 @@ def test_deepseek_v4_none_reasoning_effort_disables_thinking():
     ("reasoning_effort", "expected_mode", "expected_effort"),
     [
         ("none", "chat", None),
-        ("minimal", "thinking", "high"),
-        ("low", "thinking", "high"),
-        ("medium", "thinking", "high"),
+        ("minimal", "thinking", "low"),
+        ("low", "thinking", "low"),
+        ("medium", "thinking", "low"),
         ("high", "thinking", "high"),
-        ("xhigh", "thinking", "max"),
+        ("xhigh", "thinking", "high"),
         ("max", "thinking", "max"),
         ("unexpected", "thinking", "high"),
     ],
@@ -438,7 +481,7 @@ def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
     assert captured_kwargs[-1]["reasoning_effort"] == expected_effort
 
 
-def test_deepseek_v4_preserves_reference_max_reasoning_effort():
+def test_deepseek_v4_renders_0731_max_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -446,12 +489,10 @@ def test_deepseek_v4_preserves_reference_max_reasoning_effort():
         reasoning_effort="max",
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum")
 
 
-def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
+def test_deepseek_v4_maps_xhigh_to_high_reasoning_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -467,10 +508,10 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
 @pytest.mark.parametrize(
     ("case_id", "kwargs"),
     [
-        (1, {"thinking": True}),
-        (2, {"thinking": True}),
-        (3, {"thinking": True}),
-        (4, {}),
+        (1, {"thinking": True, "reasoning_effort": "low"}),
+        (2, {"thinking": True, "reasoning_effort": "low"}),
+        (3, {"thinking": True, "reasoning_effort": "low"}),
+        (4, {"thinking": False}),
     ],
 )
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
@@ -611,3 +652,104 @@ def test_deepseek_v4_official_api_sampling_override_is_v4_only():
     assert sampling_params.min_p == 0.05
     assert sampling_params.presence_penalty == 1.5
     assert sampling_params.frequency_penalty == 1.25
+
+def _split_turn_messages():
+    """One logical assistant turn replayed as consecutive messages."""
+    return [
+        {"role": "user", "content": "Check the server"},
+        {"role": "assistant", "content": "Let me check the server status."},
+        {
+            "role": "assistant",
+            "reasoning": "The user wants a health check. I should run uptime.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell_exec",
+                        "arguments": '{"command": "uptime"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "up 5 days",
+        },
+    ]
+
+
+def test_deepseek_v4_merges_consecutive_assistant_messages():
+    messages = _split_turn_messages()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell_exec",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tools=tools,
+        tokenize=False,
+        thinking=True,
+    )
+
+    # The split turn renders as one canonical turn:
+    # reasoning, then content, then tool calls.
+    assert (
+        "<｜Assistant｜><think>"
+        "The user wants a health check. I should run uptime."
+        "</think>Let me check the server status.\n\n<｜DSML｜tool_calls>"
+    ) in prompt
+    # No orphaned reasoning blocks: the only dangling <think> opener is the
+    # generation prompt.
+    assert prompt.count("<think>") - 1 == prompt.count("</think>")
+    # The merged turn ends with a single EOS.
+    assert prompt.count("<｜end▁of▁sentence｜>") == 1
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_merges_consecutive_assistant_messages_drop_thinking():
+    messages = _split_turn_messages()
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+        thinking=True,
+    )
+
+    # Without request tools, reasoning from earlier turns is dropped, but the
+    # split turn still renders as a single assistant turn (one EOS).
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>"
+        + _DEFAULT_EFFORT_PREAMBLE
+        + "<｜User｜>Check the server<｜Assistant｜></think>"
+        "Let me check the server status.\n\n<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="shell_exec">\n'
+        '<｜DSML｜parameter name="command" string="true">'
+        "uptime</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>"
+        "<｜User｜><tool_result>up 5 days</tool_result><｜Assistant｜><think>"
+    )
