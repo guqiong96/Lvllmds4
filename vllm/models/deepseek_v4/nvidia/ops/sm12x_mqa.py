@@ -197,9 +197,7 @@ def fp8_mqa_logits_triton(
 
 
 def _fp8_mqa_logits_block_m(num_q: int, seq_len_kv: int) -> int:
-    if seq_len_kv <= 16 * 1024:
-        return 16
-    return 64
+    return 16
 
 
 @triton.jit
