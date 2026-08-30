@@ -246,7 +246,7 @@ fastar==0.11.0
     #   fastapi-cloud-cli
 fastavro==1.12.2
     # via cohere
-fastparquet==2024.11.0
+fastparquet==2026.5.0
     # via genai-perf
 fastrlock==0.8.2
     # via cupy-cuda12x
