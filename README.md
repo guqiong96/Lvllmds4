@@ -1,5 +1,7 @@
 # Lvllmds4
 
+This project was dedicated to providing lk_moe hybrid inference integration for running DeepSeek-V4 on vLLM + SM120. Now that the mainline vLLM DeepSeek-V4 SM120 support has essentially matured, this project will no longer be updated. Please move to the Lvllm project instead. Thank you.
+
 A fork of [jasl/vllm](https://github.com/jasl/vllm) (branch: `codex/ds4-sm120-min-enable`) with CPU-GPU hybrid inference support for DeepSeek-V4 on SM120+.
 
 ## Origin
